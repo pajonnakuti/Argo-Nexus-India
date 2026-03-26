@@ -1,0 +1,14 @@
+{
+  "files": {
+    "main.css": "/Argo-Nexus-India/static/css/main.631acb00.css",
+    "main.js": "/Argo-Nexus-India/static/js/main.a7cc24b8.js",
+    "static/media/spritesheet.svg": "/Argo-Nexus-India/static/media/spritesheet.a4e0eb7ad904a4858361.svg",
+    "index.html": "/Argo-Nexus-India/index.html",
+    "main.631acb00.css.map": "/Argo-Nexus-India/static/css/main.631acb00.css.map",
+    "main.a7cc24b8.js.map": "/Argo-Nexus-India/static/js/main.a7cc24b8.js.map"
+  },
+  "entrypoints": [
+    "static/css/main.631acb00.css",
+    "static/js/main.a7cc24b8.js"
+  ]
+}
