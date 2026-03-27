@@ -1,9 +1,10 @@
-import React from 'react';
+import React, { useState } from 'react';
 
 const coreVars = ['TEMP', 'PSAL', 'PRES', 'All QC Flags', 'All Available Parameters'];
 const bioVars = ['CHLA', 'DOXY', 'NITRATE', 'PH', 'BBP700', 'IRRADIANCE', 'TEMP', 'PSAL', 'PRES', 'All QC Flags', 'All Available Parameters'];
 
 const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange }) => {
+  const [collapsed, setCollapsed] = useState(false);
   const handleChange = (e) => {
     const { name, value } = e.target;
     setParams({ ...params, [name]: value });
@@ -48,15 +49,54 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange }) => {
     }
   };
 
-  // Uses selectedVars from state for checkboxes
-
   return (
-    <div className="sidebar">
-      <div className="header">
-        <div className="logo">ARGO NEXUS</div>
-        <div className="status-badge">
-          <div className="status-dot"></div>
-          Live Connection
+    <div className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
+      <button
+        className="sidebar-toggle"
+        onClick={() => setCollapsed(prev => !prev)}
+        aria-label="Toggle Sidebar"
+      >
+        <span />
+        <span />
+        <span />
+      </button>
+      <div className="sidebar-content">
+        <div className="header">
+          <div className="brand-container">
+            {/* Logo Image */}
+            <img 
+              src={`${process.env.PUBLIC_URL}/logo-incois-argo.png`} 
+              alt="INCOIS Argo" 
+              className="nav-logo"
+            />
+    
+            {/* Brand Info and Status Badge */}
+          <div className="brand-info-row">
+            <div className="logo-text">
+              <span className="logo-main">ARGO</span>
+              <span className="logo-sub">NEXUS</span>
+            </div>
+          </div>
+          <div className="status-badge">
+            <div className="status-dot"></div>
+            <span>Live Connection</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Mini Status Block */}
+      <div className="mini-status">
+        <div className="stat-block">
+          <div className="stat-label">Active Floats</div>
+          <div className="stat-value">1,247</div>
+        </div>
+        <div className="stat-block">
+          <div className="stat-label">Core</div>
+          <div className="stat-value core">892</div>
+        </div>
+        <div className="stat-block">
+          <div className="stat-label">BGC</div>
+          <div className="stat-value bgc">355</div>
         </div>
       </div>
 
@@ -158,7 +198,10 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange }) => {
 
       <div className="section">
         <div className="section-title">
-
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <line x1="12" y1="2" x2="12" y2="22" />
+            <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+          </svg>
           Depth Range (Meters)
         </div>
         <div className="grid-2">
@@ -189,7 +232,10 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange }) => {
 
       <div className="section">
         <div className="section-title">
-
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
           Search Type
         </div>
         <div className="type-selector">
@@ -255,11 +301,8 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange }) => {
         </svg>
         Execute Search & Download
       </button>
-
-      <div className="info-text">
-        System 100% Optimized • Cost: ₹0 • Automated Retrieval
-      </div>
     </div>
+  </div>
   );
 };
 

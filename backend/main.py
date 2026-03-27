@@ -448,10 +448,13 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 path = await download_netcdf_safe(profile['file'], params['type'])
                 DOWNLOADED_COUNT += 1
+                progress_percent = int((DOWNLOADED_COUNT / TOTAL_TO_DOWNLOAD) * 60)  # map first phase to 60%
+                await websocket.send_json({"type": "progress", "value": progress_percent})
                 if DOWNLOADED_COUNT % 10 == 0 or DOWNLOADED_COUNT == TOTAL_TO_DOWNLOAD:
                     await websocket.send_json({"type": "log", "message": f"Downloaded {DOWNLOADED_COUNT}/{TOTAL_TO_DOWNLOAD} files..."})
                 return profile, path
             except Exception as e:
+                await websocket.send_json({"type": "log", "message": f"Error downloading {profile['file']}: {str(e)}"})
                 return profile, e
 
         download_tasks = [download_with_progress(p) for p in selection]
@@ -459,9 +462,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
         await websocket.send_json({"type": "log", "message": f"Extracting parameters from {TOTAL_TO_DOWNLOAD} profiles..."})
 
+        PROCESSED_COUNT = 0
         for profile, result in downloaded_results:
             if isinstance(result, Exception):
                 await websocket.send_json({"type": "log", "message": f"Error downloading {profile['file']}: {str(result)}"})
+                PROCESSED_COUNT += 1
                 continue
             
             local_path = result
@@ -485,6 +490,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     all_results.append(row)
             except Exception as e:
                 await websocket.send_json({"type": "log", "message": f"Error processing {profile['file']}: {str(e)}"})
+            finally:
+                PROCESSED_COUNT += 1
+                progress_percent = 60 + int((PROCESSED_COUNT / TOTAL_TO_DOWNLOAD) * 30)
+                await websocket.send_json({"type": "progress", "value": min(progress_percent, 90)})
+                if PROCESSED_COUNT % 10 == 0 or PROCESSED_COUNT == TOTAL_TO_DOWNLOAD:
+                    await websocket.send_json({"type": "log", "message": f"Processed {PROCESSED_COUNT}/{TOTAL_TO_DOWNLOAD} profiles for parameter extraction..."})
         
         if not all_results:
             await websocket.send_json({"type": "error", "message": "No data extracted from profiles."})
@@ -555,6 +566,7 @@ async def websocket_endpoint(websocket: WebSocket):
         # Combine BOM + CSV string
         csv_content = csv_buffer.getvalue()
         
+        await websocket.send_json({"type": "progress", "value": 100})
         await websocket.send_json({
             "type": "complete", 
             "csv": csv_content,

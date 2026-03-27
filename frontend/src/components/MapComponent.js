@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useMemo } from 'react';
 import { MapContainer, TileLayer, FeatureGroup, CircleMarker, Popup, useMap } from 'react-leaflet';
 import { EditControl } from 'react-leaflet-draw';
 import L from 'leaflet';
@@ -17,7 +17,7 @@ let DefaultIcon = L.icon({
 
 L.Marker.prototype.options.icon = DefaultIcon;
 
-const ActiveFloatsControl = ({ activeFloats, showActive, setShowActive, floatFilter, setFloatFilter, floatCounts }) => {
+const ActiveFloatsControl = ({ activeFloats, showActive, setShowActive, floatFilter, setFloatFilter, floatCounts, parameterCounts }) => {
   const map = useMap();
 
   useEffect(() => {
@@ -42,6 +42,23 @@ const ActiveFloatsControl = ({ activeFloats, showActive, setShowActive, floatFil
               </div>
               <div class="filter-option ${floatFilter === 'bgc' ? 'selected' : ''}" data-filter="bgc">
                 BGC (${floatCounts.bgc})
+              </div>
+              <div class="stat-block">
+                <div><strong>Total INCOIS Floats:</strong> ${floatCounts.total}</div>
+                <div><strong>Core:</strong> ${floatCounts.core} | <strong>BGC:</strong> ${floatCounts.bgc}</div>
+                <div class="stat-label">Parameter coverage</div>
+                <div><strong>NO<sub>3</sub>:</strong> ${parameterCounts.NO3} | <strong>DOXY:</strong> ${parameterCounts.DOXY}</div>
+                <div><strong>CHLA:</strong> ${parameterCounts.CHLA} | <strong>BBP700:</strong> ${parameterCounts.BBP700}</div>
+              </div>
+            </div>
+            <div class="map-legend">
+              <div class="legend-item">
+                <div class="legend-dot core"></div>
+                <span>Core Argo</span>
+              </div>
+              <div class="legend-item">
+                <div class="legend-dot bgc"></div>
+                <span>BGC Argo</span>
               </div>
             </div>
           </div>
@@ -77,7 +94,7 @@ const ActiveFloatsControl = ({ activeFloats, showActive, setShowActive, floatFil
     map.addControl(control);
 
     return () => map.removeControl(control);
-  }, [map, showActive, setShowActive, floatFilter, setFloatFilter, floatCounts]);
+  }, [map, showActive, setShowActive, floatFilter, setFloatFilter, floatCounts, parameterCounts]);
 
   return null;
 };
@@ -85,10 +102,53 @@ const ActiveFloatsControl = ({ activeFloats, showActive, setShowActive, floatFil
 const MapComponent = ({ onBoundsChange, bounds }) => {
   const mapRef = useRef();
   const featureGroupRef = useRef();
+  const [allFloats, setAllFloats] = useState([]);
   const [activeFloats, setActiveFloats] = useState([]);
   const [showActive, setShowActive] = useState(false);
   const [floatFilter, setFloatFilter] = useState('all');
   const [floatCounts, setFloatCounts] = useState({ total: 0, core: 0, bgc: 0 });
+
+  const incoisFloats = useMemo(() => {
+    const incois = allFloats.filter(f => {
+      const platform = String(f.platform || '').toUpperCase();
+      const argoIndex = String(f.argo_prof_index || f.argo_prof_index_name || '').toUpperCase();
+      return platform.startsWith('IN') || argoIndex.includes('IN');
+    });
+
+    const unique = [];
+    const seen = new Set();
+    incois.forEach(f => {
+      const id = String(f.platform || '').toUpperCase();
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        unique.push(f);
+      }
+    });
+    return unique;
+  }, [allFloats]);
+
+  const parameterCounts = useMemo(() => {
+    const counts = { NO3: 0, DOXY: 0, CHLA: 0, BBP700: 0 };
+    incoisFloats.forEach((float) => {
+      const params = float.parameters || float.params || float.parameter_list || [];
+      const paramList = Array.isArray(params) ? params.map(p => String(p).toUpperCase()) : [];
+
+      if (paramList.includes('NITRATE') || paramList.includes('NO3') || float.NITRATE || float.NO3) {
+        counts.NO3 += 1;
+      }
+      if (paramList.includes('DOXY') || float.DOXY) {
+        counts.DOXY += 1;
+      }
+      if (paramList.includes('CHLA') || float.CHLA) {
+        counts.CHLA += 1;
+      }
+      if (paramList.includes('BBP700') || float.BBP700) {
+        counts.BBP700 += 1;
+      }
+    });
+
+    return counts;
+  }, [activeFloats]);
 
   // Fetch active floats once
   useEffect(() => {
@@ -96,12 +156,46 @@ const MapComponent = ({ onBoundsChange, bounds }) => {
       .then(res => res.json())
       .then(data => {
         if (data && data.floats) {
-          setActiveFloats(data.floats);
-          setFloatCounts({
-            total: data.count || 0,
-            core: data.core_count || 0,
-            bgc: data.bgc_count || 0
+          const fetched = data.floats;
+          setAllFloats(fetched);
+
+          // Keep marker visibility for all active floats by default
+          setActiveFloats(fetched);
+
+          // Incois stats from filtered unique IN floats
+          const incois = fetched.filter(f => {
+            const platform = String(f.platform || '').toUpperCase();
+            const argoIndex = String(f.argo_prof_index || f.argo_prof_index_name || '').toUpperCase();
+            return platform.startsWith('IN') || argoIndex.includes('IN');
           });
+
+          const unique = [];
+          const seen = new Set();
+          incois.forEach(f => {
+            const id = String(f.platform || '').toUpperCase();
+            if (id && !seen.has(id)) {
+              seen.add(id);
+              unique.push(f);
+            }
+          });
+
+          const coreCount = unique.filter(f => String(f.type || '').toLowerCase() === 'core').length;
+          const bgcCount = unique.filter(f => String(f.type || '').toLowerCase() === 'bgc').length;
+
+          setFloatCounts({
+            total: unique.length,
+            core: coreCount,
+            bgc: bgcCount
+          });
+
+          // If no INCOIS floats found, fallback to total data for best UX
+          if (unique.length === 0) {
+            setFloatCounts({
+              total: fetched.length,
+              core: fetched.filter(f => String(f.type || '').toLowerCase() === 'core').length,
+              bgc: fetched.filter(f => String(f.type || '').toLowerCase() === 'bgc').length
+            });
+          }
         }
       })
       .catch(err => console.error("Failed to load active floats:", err));
@@ -174,17 +268,22 @@ const MapComponent = ({ onBoundsChange, bounds }) => {
   return (
     <div className="map-container">
       <MapContainer
-        center={[20, 0]}
-        zoom={2}
+        center={[20, 80]}
+        zoom={4}
         style={{ height: '100vh', width: '100%' }}
         ref={mapRef}
         whenCreated={(mapInstance) => {
           mapRef.current = mapInstance;
         }}
       >
-        <TileLayer
+        /*<TileLayer
           url="https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}"
           attribution='Tiles &copy; Esri &mdash; Sources: GEBCO, NOAA, CHS, OSU, UNH, CSUMB, National Geographic, DeLorme, NAVTEQ, and Esri'
+        /> */
+        
+        <TileLayer
+          url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Physical_Map/MapServer/tile/{z}/{y}/{x}"
+          attribution='Tiles &copy; Esri &mdash; Source: US NPS'
         />
         <FeatureGroup ref={featureGroupRef}>
           <EditControl
@@ -213,6 +312,7 @@ const MapComponent = ({ onBoundsChange, bounds }) => {
           floatFilter={floatFilter}
           setFloatFilter={setFloatFilter}
           floatCounts={floatCounts}
+          parameterCounts={parameterCounts}
         />
 
         {showActive && activeFloats.filter(f => floatFilter === 'all' || f.type === floatFilter).map(float => {
@@ -223,16 +323,22 @@ const MapComponent = ({ onBoundsChange, bounds }) => {
              displayDate = `${rawDate.slice(0,4)}-${rawDate.slice(4,6)}-${rawDate.slice(6,8)}`;
           }
 
+          const colorByType = float.type === 'core'
+            ? { stroke: '#facc15', fill: '#fef08a' } // bright yellow
+            : float.type === 'bgc'
+              ? { stroke: '#7c3aed', fill: '#c4b5fd' } // purple
+              : { stroke: '#8b5cf6', fill: '#c4b5fd' };
+
           return (
             <CircleMarker
               key={float.platform}
               center={[float.lat, float.lon]}
-              radius={5}
+              radius={6}
               pathOptions={{
-                color: '#ca8a04', // Darker yellow outline
-                weight: 1,
-                fillColor: '#fef08a', // vibrant yellow fill
-                fillOpacity: 0.8
+                color: colorByType.stroke,
+                weight: 2,
+                fillColor: colorByType.fill,
+                fillOpacity: 0.85
               }}
             >
               <Popup className="active-float-popup">
