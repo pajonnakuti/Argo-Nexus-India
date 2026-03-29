@@ -210,7 +210,7 @@ const MapPanner = ({ center }) => {
 };
 
 // ── Main MapComponent ─────────────────────────────────────────────────────────
-const MapComponent = ({ onBoundsChange, bounds }) => {
+const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate }) => {
   const mapRef = useRef();
   const featureGroupRef = useRef();
 
@@ -277,13 +277,15 @@ const MapComponent = ({ onBoundsChange, bounds }) => {
       .then(data => {
         if (data && data.floats) {
           setActiveFloats(data.floats);
-          setFloatCounts({
+          const counts = {
             total: data.count || 0,
             core: data.core_count || 0,
             bgc: data.bgc_count || 0,
             ocean: data.ocean_counts || {},
             inst: data.inst_counts || {}
-          });
+          };
+          setFloatCounts(counts);
+          if (onFloatCountsUpdate) onFloatCountsUpdate(counts);
         }
       })
       .catch(err => console.error("Failed to load active floats:", err));
@@ -522,9 +524,9 @@ const MapComponent = ({ onBoundsChange, bounds }) => {
                 center={[float.lat, float.lon]}
                 radius={isSelected ? 9 : 5}
                 pathOptions={{
-                  color: isSelected ? '#f97316' : '#ca8a04',
+                  color: isSelected ? '#f97316' : (float.type === 'bgc' ? '#7c3aed' : '#ca8a04'),
                   weight: isSelected ? 2.5 : 1,
-                  fillColor: isSelected ? '#fed7aa' : '#fef08a',
+                  fillColor: isSelected ? '#fed7aa' : (float.type === 'bgc' ? '#c084fc' : '#fef08a'),
                   fillOpacity: 0.9
                 }}
                 eventHandlers={{

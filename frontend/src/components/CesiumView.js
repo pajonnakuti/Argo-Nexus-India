@@ -65,7 +65,7 @@ const CesiumView = ({
                points.add({
                   position: Cesium.Cartesian3.fromDegrees(float.lon, float.lat),
                   pixelSize: isSelected ? 16 : 8,
-                  color: isSelected ? Cesium.Color.ORANGE : Cesium.Color.YELLOW,
+                  color: isSelected ? Cesium.Color.ORANGE : (float.type === 'bgc' ? Cesium.Color.fromCssColorString('#c084fc') : Cesium.Color.YELLOW),
                   outlineColor: Cesium.Color.BLACK,
                   outlineWidth: 1,
                   id: { _floatData: float } 

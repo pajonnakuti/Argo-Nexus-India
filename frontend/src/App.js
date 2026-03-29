@@ -17,6 +17,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [previewData, setPreviewData] = useState(null);
   const [logs, setLogs] = useState([]);
+  const [floatCounts, setFloatCounts] = useState({ total: 0, core: 0, bgc: 0, ocean: {}, inst: {} });
 
   const handleBoundsChange = (newBounds) => {
     setBounds(newBounds);
@@ -108,9 +109,10 @@ function App() {
         setParams={setParams}
         onSubmit={handleSubmit}
         onBoundsChange={handleBoundsChange}
+        floatCounts={floatCounts}
       />
       <div className="map-container">
-        <MapComponent onBoundsChange={setBounds} bounds={bounds} />
+        <MapComponent onBoundsChange={setBounds} bounds={bounds} onFloatCountsUpdate={setFloatCounts} />
         {previewData && (
           <DataPreview 
             csvData={previewData} 

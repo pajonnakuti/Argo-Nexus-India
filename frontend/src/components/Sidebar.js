@@ -3,7 +3,7 @@ import React, { useState } from 'react';
 const coreVars = ['TEMP', 'PSAL', 'PRES', 'All QC Flags', 'All Available Parameters'];
 const bioVars = ['CHLA', 'DOXY', 'NITRATE', 'PH', 'BBP700', 'IRRADIANCE', 'PRES', 'All QC Flags', 'All Available Parameters'];
 
-const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange }) => {
+const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange, floatCounts }) => {
   const [collapsed, setCollapsed] = useState(false);
 
   const handleChange = (e) => {
@@ -81,15 +81,15 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange }) => {
         <div className="mini-status">
           <div className="stat-block">
             <div className="stat-label">Active Floats</div>
-            <div className="stat-value">1,247</div>
+            <div className="stat-value">{floatCounts?.total?.toLocaleString() || '—'}</div>
           </div>
           <div className="stat-block">
             <div className="stat-label">Core</div>
-            <div className="stat-value core">892</div>
+            <div className="stat-value core">{floatCounts?.core?.toLocaleString() || '—'}</div>
           </div>
           <div className="stat-block">
             <div className="stat-label">BGC</div>
-            <div className="stat-value bgc">355</div>
+            <div className="stat-value bgc">{floatCounts?.bgc?.toLocaleString() || '—'}</div>
           </div>
         </div>
 
