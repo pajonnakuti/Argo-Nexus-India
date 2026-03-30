@@ -71,6 +71,10 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange, floatCou
             alt="INCOIS Argo Nexus" 
             className="nav-logo"
           />
+          <div className="app-title-display">
+            <span className="app-title-argo">ARGO</span>
+            <span className="app-title-nexus">NEXUS</span>
+          </div>
           <div className="status-badge">
             <div className="status-dot"></div>
             Live Connection
