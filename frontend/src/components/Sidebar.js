@@ -84,11 +84,11 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange, floatCou
         {/* Mini Status Block */}
         <div className="mini-status">
           <div className="stat-block">
-            <div className="stat-label">Active Floats</div>
+            <div className="stat-label">ACTIVE<br/>FLOATS</div>
             <div className="stat-value">{floatCounts?.total?.toLocaleString() || '—'}</div>
           </div>
           <div className="stat-block">
-            <div className="stat-label">Core</div>
+            <div className="stat-label">CORE</div>
             <div className="stat-value core">{floatCounts?.core?.toLocaleString() || '—'}</div>
           </div>
           <div className="stat-block">
