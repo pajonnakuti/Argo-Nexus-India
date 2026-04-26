@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
+from gridding import grid_argo_data
 import httpx
 import pandas as pd
 import numpy as np
@@ -65,6 +66,22 @@ class Bounds(BaseModel):
 class ProcessRequest(BaseModel):
     bounds: Bounds
     params: SearchParams
+
+class GridRequest(BaseModel):
+    bounds: Bounds
+    params: SearchParams
+    variable: str = 'TEMP'
+    depth_level: float = 10.0
+    depth_tolerance: float = 50.0
+    resolution: float = 0.5
+    method: str = 'oi'  # 'oi', 'linear', 'nearest'
+    corr_length: float = 2.0
+    snr: float = 1.0
+
+class ExportRequest(BaseModel):
+    bounds: Bounds
+    params: SearchParams
+    selectedVars: Optional[List[str]] = None
 async def load_bio_index():
     "loads the index file from the bio link and sorts it for binary search"
     global CACHED_PROFILES_BIO, DATE_SORTED_PROFILES_BIO
@@ -762,6 +779,354 @@ async def get_trajectory(platform_id: str):
         "last_date": sorted_points[-1]['date'],
         "points": sorted_points
     }
+
+
+# ── Shared Search & Extract Helper ─────────────────────────────────────────────
+async def search_and_extract(bounds_dict, params_dict):
+    """
+    Shared helper: performs date filter → geo filter → download → extract.
+    Returns (all_results, stats_dict) where all_results is a list of row dicts.
+    """
+    params_obj = ParamsObj({
+        'minDepth': float(params_dict.get('minDepth', 0)),
+        'maxDepth': float(params_dict.get('maxDepth', 2000)),
+    })
+
+    def safe_float(val, default):
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return default
+
+    raw_north = safe_float(bounds_dict.get('north'), 90.0)
+    raw_south = safe_float(bounds_dict.get('south'), -90.0)
+    raw_east  = safe_float(bounds_dict.get('east'),  180.0)
+    raw_west  = safe_float(bounds_dict.get('west'),  -180.0)
+
+    norm_bounds = {
+        'north': max(raw_north, raw_south),
+        'south': min(raw_north, raw_south),
+        'east':  max(raw_east, raw_west),
+        'west':  min(raw_east, raw_west),
+    }
+
+    # Date filter
+    candidates = binary_search_date_range(
+        params_dict['startDate'],
+        params_dict['endDate'],
+        params_dict.get('type', 'core')
+    )
+
+    # Geo filter
+    filtered = [
+        p for p in candidates
+        if norm_bounds['south'] <= p['lat'] <= norm_bounds['north'] and
+           norm_bounds['west'] <= p['lon'] <= norm_bounds['east']
+    ]
+
+    # Abs-lon fallback
+    if not filtered and (norm_bounds['east'] <= 0 or norm_bounds['west'] <= 0):
+        abs_bounds = {
+            'north': norm_bounds['north'],
+            'south': norm_bounds['south'],
+            'east':  max(abs(norm_bounds['east']), abs(norm_bounds['west'])),
+            'west':  min(abs(norm_bounds['east']), abs(norm_bounds['west'])),
+        }
+        filtered = [
+            p for p in candidates
+            if abs_bounds['south'] <= p['lat'] <= abs_bounds['north'] and
+               abs_bounds['west'] <= p['lon'] <= abs_bounds['east']
+        ]
+
+    if not filtered:
+        return [], {'total': 0, 'extracted': 0, 'errors': 0}
+
+    loop = asyncio.get_event_loop()
+    all_results = []
+    error_count = 0
+    extracted_count = 0
+
+    for chunk_start in range(0, len(filtered), BATCH_CHUNK_SIZE):
+        chunk = filtered[chunk_start:chunk_start + BATCH_CHUNK_SIZE]
+
+        async def download_one(profile):
+            try:
+                path = await download_with_retry(profile['file'])
+                return profile, path
+            except Exception as e:
+                return profile, e
+
+        download_results = await asyncio.gather(*[download_one(p) for p in chunk])
+
+        for profile, result in download_results:
+            if isinstance(result, Exception):
+                error_count += 1
+                continue
+            try:
+                extracted = await loop.run_in_executor(
+                    PROCESS_POOL, process_netcdf, result, params_obj
+                )
+                filename = os.path.basename(profile['file'])
+                platform, cycle = extract_metadata(filename)
+                for row in extracted:
+                    row.update({
+                        'Date': profile['date'],
+                        'Latitude': profile['lat'],
+                        'Longitude': profile['lon'],
+                        'Platform': platform,
+                        'Cycle': cycle,
+                        'Institution': profile.get('institution', ''),
+                        'Ocean': profile.get('ocean', ''),
+                        'File': filename
+                    })
+                    all_results.append(row)
+                extracted_count += 1
+            except Exception:
+                error_count += 1
+
+    return all_results, {
+        'total': len(filtered),
+        'extracted': extracted_count,
+        'errors': error_count
+    }
+
+
+# ── Multi-Format Export Endpoints ──────────────────────────────────────────────
+
+@app.post("/api/export/csv")
+async def export_csv(req: ExportRequest):
+    """Export search results as CSV."""
+    bounds_dict = req.bounds.dict()
+    params_dict = req.params.dict()
+    params_dict['selectedVars'] = req.selectedVars or []
+
+    all_results, stats = await search_and_extract(bounds_dict, params_dict)
+    if not all_results:
+        raise HTTPException(status_code=404, detail="No data found for the given search parameters.")
+
+    df = pd.DataFrame(all_results)
+    df.replace('', np.nan, inplace=True)
+    df.dropna(axis=1, how='all', inplace=True)
+    df.rename(columns={'depth': 'Depth (dbar)'}, inplace=True)
+
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_content = csv_buffer.getvalue()
+
+    return Response(
+        content="\ufeff" + csv_content,
+        media_type='text/csv',
+        headers={
+            'Content-Disposition': f'attachment; filename="argo_export_{stats["total"]}_profiles.csv"'
+        }
+    )
+
+
+@app.post("/api/export/json")
+async def export_json(req: ExportRequest):
+    """Export search results as JSON."""
+    bounds_dict = req.bounds.dict()
+    params_dict = req.params.dict()
+    params_dict['selectedVars'] = req.selectedVars or []
+
+    all_results, stats = await search_and_extract(bounds_dict, params_dict)
+    if not all_results:
+        raise HTTPException(status_code=404, detail="No data found for the given search parameters.")
+
+    # Clean up NaN values for JSON serialization
+    clean_results = []
+    for row in all_results:
+        clean_row = {}
+        for k, v in row.items():
+            if isinstance(v, float) and np.isnan(v):
+                clean_row[k] = None
+            else:
+                clean_row[k] = v
+        clean_results.append(clean_row)
+
+    output = {
+        "metadata": {
+            "total_profiles": stats['total'],
+            "extracted_profiles": stats['extracted'],
+            "total_rows": len(clean_results),
+            "errors": stats['errors'],
+            "search_params": params_dict,
+            "bounds": bounds_dict,
+        },
+        "data": clean_results
+    }
+
+    json_content = json.dumps(output, indent=2, default=str)
+
+    return Response(
+        content=json_content,
+        media_type='application/json',
+        headers={
+            'Content-Disposition': f'attachment; filename="argo_export_{stats["total"]}_profiles.json"'
+        }
+    )
+
+
+@app.post("/api/export/netcdf")
+async def export_netcdf(req: ExportRequest):
+    """Export search results as NetCDF."""
+    bounds_dict = req.bounds.dict()
+    params_dict = req.params.dict()
+    params_dict['selectedVars'] = req.selectedVars or []
+
+    all_results, stats = await search_and_extract(bounds_dict, params_dict)
+    if not all_results:
+        raise HTTPException(status_code=404, detail="No data found for the given search parameters.")
+
+    df = pd.DataFrame(all_results)
+    df.replace('', np.nan, inplace=True)
+    df.dropna(axis=1, how='all', inplace=True)
+
+    # Convert string columns that should be numeric
+    for col in df.columns:
+        if col not in ['Date', 'Platform', 'Cycle', 'Institution', 'Ocean', 'File']:
+            try:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            except Exception:
+                pass
+
+    # Build xarray Dataset from the DataFrame
+    ds = xr.Dataset.from_dataframe(df.reset_index(drop=True))
+
+    # Add global attributes
+    ds.attrs = {
+        'title': 'Argo Nexus Data Export',
+        'source': 'Argo Nexus India — IFREMER GDAC',
+        'institution': 'INCOIS',
+        'total_profiles': stats['total'],
+        'extracted_profiles': stats['extracted'],
+        'conventions': 'CF-1.8',
+    }
+
+    # Write to bytes buffer
+    nc_buffer = io.BytesIO()
+    ds.to_netcdf(nc_buffer, engine='scipy')
+    nc_bytes = nc_buffer.getvalue()
+
+    return Response(
+        content=nc_bytes,
+        media_type='application/x-netcdf',
+        headers={
+            'Content-Disposition': f'attachment; filename="argo_export_{stats["total"]}_profiles.nc"'
+        }
+    )
+
+
+# ── Gridded Data Product Endpoint ──────────────────────────────────────────────
+
+@app.post("/api/grid")
+async def generate_grid(req: GridRequest):
+    """
+    Generate a gridded data product from Argo profiles using DIVA-style
+    Optimal Interpolation.
+    """
+    bounds_dict = req.bounds.dict()
+    params_dict = req.params.dict()
+
+    all_results, stats = await search_and_extract(bounds_dict, params_dict)
+    if not all_results:
+        raise HTTPException(status_code=404, detail="No data found for gridding.")
+
+    # Run the gridding in the process pool (CPU-intensive)
+    loop = asyncio.get_event_loop()
+    gridded_ds = await loop.run_in_executor(
+        PROCESS_POOL,
+        grid_argo_data,
+        all_results,
+        req.variable,
+        bounds_dict,
+        req.depth_level,
+        req.depth_tolerance,
+        req.resolution,
+        req.method,
+        req.corr_length,
+        req.snr
+    )
+
+    if gridded_ds is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Insufficient data for gridding variable '{req.variable}' at depth {req.depth_level}m. Need at least 3 observations."
+        )
+
+    # Convert to JSON-serializable response
+    grid_data = gridded_ds[req.variable].values.tolist()
+    lats = gridded_ds['lat'].values.tolist()
+    lons = gridded_ds['lon'].values.tolist()
+
+    # Replace NaN with null for JSON
+    def clean_grid(data):
+        if isinstance(data, list):
+            return [clean_grid(x) for x in data]
+        if isinstance(data, float) and (np.isnan(data) or np.isinf(data)):
+            return None
+        return data
+
+    return {
+        "variable": req.variable,
+        "depth_level": req.depth_level,
+        "resolution": req.resolution,
+        "method": req.method,
+        "n_observations": int(gridded_ds.attrs.get('n_observations', 0)),
+        "n_profiles": stats['total'],
+        "lats": lats,
+        "lons": lons,
+        "grid": clean_grid(grid_data),
+        "bounds": bounds_dict,
+        "stats": {
+            "min": float(np.nanmin(gridded_ds[req.variable].values)) if not np.all(np.isnan(gridded_ds[req.variable].values)) else None,
+            "max": float(np.nanmax(gridded_ds[req.variable].values)) if not np.all(np.isnan(gridded_ds[req.variable].values)) else None,
+            "mean": float(np.nanmean(gridded_ds[req.variable].values)) if not np.all(np.isnan(gridded_ds[req.variable].values)) else None,
+        }
+    }
+
+
+@app.post("/api/grid/download")
+async def download_grid_netcdf(req: GridRequest):
+    """
+    Generate and download gridded data product as NetCDF file.
+    """
+    bounds_dict = req.bounds.dict()
+    params_dict = req.params.dict()
+
+    all_results, stats = await search_and_extract(bounds_dict, params_dict)
+    if not all_results:
+        raise HTTPException(status_code=404, detail="No data found for gridding.")
+
+    loop = asyncio.get_event_loop()
+    gridded_ds = await loop.run_in_executor(
+        PROCESS_POOL,
+        grid_argo_data,
+        all_results,
+        req.variable,
+        bounds_dict,
+        req.depth_level,
+        req.depth_tolerance,
+        req.resolution,
+        req.method,
+        req.corr_length,
+        req.snr
+    )
+
+    if gridded_ds is None:
+        raise HTTPException(status_code=422, detail="Insufficient data for gridding.")
+
+    nc_buffer = io.BytesIO()
+    gridded_ds.to_netcdf(nc_buffer, engine='scipy')
+    nc_bytes = nc_buffer.getvalue()
+
+    return Response(
+        content=nc_bytes,
+        media_type='application/x-netcdf',
+        headers={
+            'Content-Disposition': f'attachment; filename="argo_gridded_{req.variable}_{req.depth_level}m_{req.resolution}deg.nc"'
+        }
+    )
 
 
 if __name__ == "__main__":

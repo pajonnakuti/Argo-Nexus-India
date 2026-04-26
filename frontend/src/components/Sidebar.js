@@ -3,8 +3,24 @@ import React, { useState } from 'react';
 const coreVars = ['TEMP', 'PSAL', 'PRES', 'All QC Flags', 'All Available Parameters'];
 const bioVars = ['CHLA', 'DOXY', 'NITRATE', 'PH', 'BBP700', 'IRRADIANCE', 'PRES', 'All QC Flags', 'All Available Parameters'];
 
-const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange, floatCounts }) => {
+const gridVars = ['TEMP', 'PSAL', 'DOXY', 'CHLA', 'NITRATE', 'PH', 'BBP700'];
+const resolutionOptions = [0.25, 0.5, 1.0];
+const methodOptions = [
+  { value: 'oi', label: 'Optimal Interpolation' },
+  { value: 'linear', label: 'Linear' },
+  { value: 'nearest', label: 'Nearest Neighbor' },
+];
+
+const Sidebar = ({
+  bounds, params, setParams,
+  onSubmit, onBoundsChange, floatCounts,
+  downloadFormat, setDownloadFormat,
+  gridConfig, setGridConfig,
+  onGridSubmit, gridLoading,
+  onExport
+}) => {
   const [collapsed, setCollapsed] = useState(false);
+  const [gridPanelOpen, setGridPanelOpen] = useState(false);
 
   const handleChange = (e) => {
     const { name, value } = e.target;
@@ -49,8 +65,6 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange, floatCou
       onBoundsChange({ ...bounds, [name]: numValue });
     }
   };
-
-  // Uses selectedVars from state for checkboxes
 
   return (
     <div className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
@@ -195,7 +209,6 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange, floatCou
 
       <div className="section">
         <div className="section-title">
-
           Depth Range (Meters)
         </div>
         <div className="grid-2">
@@ -226,7 +239,6 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange, floatCou
 
       <div className="section">
         <div className="section-title">
-
           Search Type
         </div>
         <div className="type-selector">
@@ -284,14 +296,172 @@ const Sidebar = ({ bounds, params, setParams, onSubmit, onBoundsChange, floatCou
         </div>
       </div>
 
+      {/* ── Download Format Selector ── */}
+      <div className="section">
+        <div className="section-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+          </svg>
+          Export Format
+        </div>
+        <div className="format-selector">
+          {['csv', 'json', 'netcdf'].map(fmt => (
+            <button
+              key={fmt}
+              className={`format-btn ${downloadFormat === fmt ? 'active' : ''}`}
+              onClick={() => setDownloadFormat(fmt)}
+            >
+              {fmt === 'netcdf' ? 'NetCDF' : fmt.toUpperCase()}
+            </button>
+          ))}
+        </div>
+      </div>
+
       <button className="btn-primary" onClick={onSubmit}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
           <polyline points="7 10 12 15 17 10" />
           <line x1="12" y1="15" x2="12" y2="3" />
         </svg>
-        Execute Search & Download
+        {'Export as ' + (downloadFormat === 'netcdf' ? 'NetCDF' : downloadFormat.toUpperCase())}
       </button>
+
+      {/* ── Section Divider ── */}
+      <div className="sidebar-divider" />
+
+      {/* ── Gridded Data Product ── */}
+      <div className="section">
+        <div
+          className="section-title collapsible"
+          onClick={() => setGridPanelOpen(prev => !prev)}
+          style={{ cursor: 'pointer', userSelect: 'none' }}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <rect x="3" y="3" width="7" height="7" />
+            <rect x="14" y="3" width="7" height="7" />
+            <rect x="14" y="14" width="7" height="7" />
+            <rect x="3" y="14" width="7" height="7" />
+          </svg>
+          Gridded Product (OI)
+          <span className={`collapse-arrow ${gridPanelOpen ? 'open' : ''}`}>&#9656;</span>
+        </div>
+
+        {gridPanelOpen && (
+          <div className="grid-panel-body">
+            {/* Variable */}
+            <div className="input-group">
+              <span className="input-label">Variable</span>
+              <select
+                className="input-field"
+                value={gridConfig.variable}
+                onChange={e => setGridConfig({ ...gridConfig, variable: e.target.value })}
+              >
+                {gridVars.map(v => <option key={v} value={v}>{v}</option>)}
+              </select>
+            </div>
+
+            {/* Depth + Tolerance */}
+            <div className="grid-2">
+              <div className="input-group">
+                <span className="input-label">Depth (m)</span>
+                <input
+                  type="number"
+                  className="input-field"
+                  value={gridConfig.depth_level}
+                  onChange={e => setGridConfig({ ...gridConfig, depth_level: parseFloat(e.target.value) || 0 })}
+                />
+              </div>
+              <div className="input-group">
+                <span className="input-label">Tolerance (±m)</span>
+                <input
+                  type="number"
+                  className="input-field"
+                  value={gridConfig.depth_tolerance}
+                  onChange={e => setGridConfig({ ...gridConfig, depth_tolerance: parseFloat(e.target.value) || 50 })}
+                />
+              </div>
+            </div>
+
+            {/* Resolution */}
+            <div className="input-group">
+              <span className="input-label">Grid Resolution</span>
+              <div className="format-selector">
+                {resolutionOptions.map(r => (
+                  <button
+                    key={r}
+                    className={`format-btn ${gridConfig.resolution === r ? 'active' : ''}`}
+                    onClick={() => setGridConfig({ ...gridConfig, resolution: r })}
+                  >
+                    {r}°
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Method */}
+            <div className="input-group">
+              <span className="input-label">Interpolation Method</span>
+              <select
+                className="input-field"
+                value={gridConfig.method}
+                onChange={e => setGridConfig({ ...gridConfig, method: e.target.value })}
+              >
+                {methodOptions.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+              </select>
+            </div>
+
+            {/* OI-only params */}
+            {gridConfig.method === 'oi' && (
+              <div className="grid-2">
+                <div className="input-group">
+                  <span className="input-label">Corr. Length (°)</span>
+                  <input
+                    type="number"
+                    step="0.5"
+                    className="input-field"
+                    value={gridConfig.corr_length}
+                    onChange={e => setGridConfig({ ...gridConfig, corr_length: parseFloat(e.target.value) || 2.0 })}
+                  />
+                </div>
+                <div className="input-group">
+                  <span className="input-label">SNR</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    className="input-field"
+                    value={gridConfig.snr}
+                    onChange={e => setGridConfig({ ...gridConfig, snr: parseFloat(e.target.value) || 1.0 })}
+                  />
+                </div>
+              </div>
+            )}
+
+            <button
+              className="btn-grid-generate"
+              onClick={onGridSubmit}
+              disabled={gridLoading}
+            >
+              {gridLoading ? (
+                <>
+                  <span className="btn-spinner" />
+                  Generating...
+                </>
+              ) : (
+                <>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <rect x="3" y="3" width="7" height="7" />
+                    <rect x="14" y="3" width="7" height="7" />
+                    <rect x="14" y="14" width="7" height="7" />
+                    <rect x="3" y="14" width="7" height="7" />
+                  </svg>
+                  Generate Gridded Product
+                </>
+              )}
+            </button>
+          </div>
+        )}
+      </div>
 
       <div className="info-text">
         System 100% Optimized • Cost: ₹0 • Automated Retrieval
