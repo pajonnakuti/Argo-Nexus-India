@@ -319,6 +319,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
             incoisTotal: data.incois_total || 0,
             incoisVisible: data.incois_visible || 0
           };
+          setActiveFloats(data.floats);
           setFloatCounts(counts);
           if (onFloatCountsUpdate) onFloatCountsUpdate(counts);
       })
