@@ -93,7 +93,8 @@ const ActiveFloatsControl = ({ showActive, setShowActive, showInactive, setShowI
               ${instOptionsHtml}
               <div class="filter-divider"></div>
               <div style="font-size: 0.75rem; text-align: center;">
-                <div><strong>Total INCOIS Floats:</strong> ${floatCounts.total}</div>
+                <div><strong>Total Global Floats:</strong> ${floatCounts.total}</div>
+                <div><strong>Total INCOIS Floats:</strong> ${floatCounts.incoisTotal} (${floatCounts.incoisVisible} in view)</div>
                 <div><strong>Core:</strong> ${floatCounts.core} | <strong>BGC:</strong> ${floatCounts.bgc}</div>
               </div>
               <div class="parameter-coverage">
@@ -236,7 +237,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
   const [floatFilter, setFloatFilter] = useState('all');
   const [oceanFilter, setOceanFilter] = useState('all');
   const [instFilter, setInstFilter] = useState('all');
-  const [floatCounts, setFloatCounts] = useState({ total: 0, core: 0, bgc: 0, ocean: {}, inst: {} });
+  const [floatCounts, setFloatCounts] = useState({ total: 0, core: 0, bgc: 0, ocean: {}, inst: {}, incoisTotal: 0, incoisVisible: 0 });
 
   const incoisFloats = useMemo(() => {
     const incois = activeFloats.filter(f => {
@@ -285,9 +286,13 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
   const [trajectoryInfo, setTrajectoryInfo] = useState(null);
   const [trajLoading, setTrajLoading] = useState(false);
   const [panCenter, setPanCenter] = useState(null);
+  
+  // Map loading state for date/filter changes
+  const [isMapLoading, setIsMapLoading] = useState(false);
 
   // Fetch active floats when dates change
   useEffect(() => {
+    setIsMapLoading(true);
     let url = 'http://localhost:8000/api/active_floats';
     const queryParams = new URLSearchParams();
     if (startDate) queryParams.append('startDate', startDate);
@@ -297,20 +302,29 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
     fetch(url)
       .then(res => res.json())
       .then(data => {
-        if (data && data.floats) {
-          setActiveFloats(data.floats);
+          // Count truly active floats (pinged in last 90 days)
+          const trulyActiveCount = data.floats.filter(f => f.status === 'active').length;
+          const trulyActiveCore = data.floats.filter(f => f.status === 'active' && f.type === 'core').length;
+          const trulyActiveBgc = data.floats.filter(f => f.status === 'active' && f.type === 'bgc').length;
+
           const counts = {
-            total: data.count || 0,
+            totalQueried: data.count || 0,
+            totalActive: trulyActiveCount,
+            activeCore: trulyActiveCore,
+            activeBgc: trulyActiveBgc,
             core: data.core_count || 0,
             bgc: data.bgc_count || 0,
             ocean: data.ocean_counts || {},
-            inst: data.inst_counts || {}
+            inst: data.inst_counts || {},
+            incoisTotal: data.incois_total || 0,
+            incoisVisible: data.incois_visible || 0
           };
           setFloatCounts(counts);
           if (onFloatCountsUpdate) onFloatCountsUpdate(counts);
         }
       })
-      .catch(err => console.error("Failed to load active floats:", err));
+      .catch(err => console.error("Failed to load active floats:", err))
+      .finally(() => setIsMapLoading(false));
   }, [startDate, endDate]);
 
   // Sync bounding-box rectangle
@@ -470,6 +484,32 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
           floatCounts={floatCounts}
           parameterCounts={parameterCounts}
         />
+
+        {/* ── Loading Overlay ── */}
+        {isMapLoading && (
+          <div style={{
+            position: 'absolute',
+            top: 0, left: 0, right: 0, bottom: 0,
+            backgroundColor: 'rgba(255, 255, 255, 0.7)',
+            zIndex: 9999,
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
+            alignItems: 'center',
+            backdropFilter: 'blur(2px)'
+          }}>
+            <div className="spinner" style={{
+              width: '40px', height: '40px',
+              border: '4px solid #f3f3f3',
+              borderTop: '4px solid #0284C7',
+              borderRadius: '50%',
+              animation: 'spin 1s linear infinite'
+            }}></div>
+            <div style={{ marginTop: '15px', color: '#0F172A', fontWeight: '600', fontSize: '1.1rem' }}>
+              Fetching Argo Data...
+            </div>
+          </div>
+        )}
 
         {/* ── Trajectory Polyline ── */}
         {polylinePositions.length > 1 && (

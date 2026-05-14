@@ -7,9 +7,15 @@ import axios from 'axios';
 
 function App() {
   const [bounds, setBounds] = useState(null);
+  const today = new Date();
+  const thirtyDaysAgo = new Date(today);
+  thirtyDaysAgo.setDate(today.getDate() - 30);
+  
+  const formatDate = (d) => d.toISOString().split('T')[0];
+
   const [params, setParams] = useState({
-    startDate: '2020-01-01',
-    endDate: '2024-12-31',
+    startDate: formatDate(thirtyDaysAgo),
+    endDate: formatDate(today),
     minDepth: 0,
     maxDepth: 2000,
     type: 'core',

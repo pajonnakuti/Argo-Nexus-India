@@ -99,6 +99,8 @@ LOCAL_INDEX_PATH = 'ar_index_global_prof.txt'
 REMOTE_INDEX_URL = 'https://data-argo.ifremer.fr/ar_index_global_prof.txt'
 DOWNLOADS_DIR = 'downloads'
 BIO_INDEX_PATH = 'argo_bio-profile_index.txt'
+META_INDEX_PATH = 'ar_index_global_meta.txt'
+REMOTE_META_URL = 'https://data-argo.ifremer.fr/ar_index_global_meta.txt'
 # Ensure downloads directory exists
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
@@ -120,16 +122,25 @@ async def init_db():
                 type TEXT
             )
         ''')
+        # Metadata table — source of truth for float-to-institution mapping
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS metadata (
+                platform TEXT PRIMARY KEY,
+                profiler_type TEXT,
+                institution TEXT,
+                date_update TEXT
+            )
+        ''')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_date ON profiles(date)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_type ON profiles(type)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_geo ON profiles(lat, lon)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_meta_inst ON metadata(institution)')
         await db.commit()
 
-        # Check if we need to sync
+        # Check if we need to sync profiles
         cursor = await db.execute('SELECT COUNT(*) FROM profiles')
         count = (await cursor.fetchone())[0]
         
-        # Simple heuristic: if DB is empty or txt files are newer, sync
         needs_sync = count == 0
         if not needs_sync:
             for path in [LOCAL_INDEX_PATH, BIO_INDEX_PATH]:
@@ -140,15 +151,21 @@ async def init_db():
         if needs_sync:
             print("Syncing SQLite DB from index files...")
             await sync_index_to_db(db)
+
+        # Check if we need to sync metadata
+        cursor = await db.execute('SELECT COUNT(*) FROM metadata')
+        meta_count = (await cursor.fetchone())[0]
+        
+        needs_meta_sync = meta_count == 0
+        if not needs_meta_sync and os.path.exists(META_INDEX_PATH):
+            if os.path.getmtime(META_INDEX_PATH) > os.path.getmtime(DB_PATH):
+                needs_meta_sync = True
+        
+        if needs_meta_sync:
+            print("Syncing metadata from ar_index_global_meta.txt...")
+            await sync_metadata_to_db(db)
             
         # Load BGC platforms into memory for quick lookup
-        cursor = await db.execute("SELECT DISTINCT REPLACE(SUBSTR(file, INSTR(file, '/') + 1), SUBSTR(file, INSTR(file, '_')), '') FROM profiles WHERE type='bio'")
-        async for row in cursor:
-            # This is a bit complex via SQL, easier to just regex the filenames if needed, 
-            # but let's just populate BGC_PLATFORMS from the 'bio' entries
-            pass
-        
-        # Better: just populate BGC_PLATFORMS by scanning bio entries once
         cursor = await db.execute("SELECT file FROM profiles WHERE type='bio'")
         async for row in cursor:
             filename = os.path.basename(row[0])
@@ -156,10 +173,16 @@ async def init_db():
             if match:
                 BGC_PLATFORMS.add(match.group(2))
         print(f"Loaded {len(BGC_PLATFORMS)} BGC platforms")
+        
+        # Log metadata counts for verification
+        cursor = await db.execute("SELECT COUNT(*) FROM metadata")
+        total_meta = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM metadata WHERE institution = 'IN'")
+        incois_meta = (await cursor.fetchone())[0]
+        print(f"Metadata: {total_meta} total floats, {incois_meta} INCOIS floats")
 
 async def sync_index_to_db(db):
     """Parses .txt files and inserts into SQLite."""
-    # Ensure files exist (download if not)
     await ensure_index_files()
     
     for ptype, path in [('core', LOCAL_INDEX_PATH), ('bio', BIO_INDEX_PATH)]:
@@ -186,9 +209,62 @@ async def sync_index_to_db(db):
                 await db.executemany('INSERT OR REPLACE INTO profiles VALUES (?,?,?,?,?,?,?,?)', batch)
     await db.commit()
 
+async def sync_metadata_to_db(db):
+    """Parses ar_index_global_meta.txt and inserts into the metadata table.
+    
+    Format: file,profiler_type,institution,date_update
+    Example: aoml/13857/13857_meta.nc,845,AO,20181011200014
+    
+    The platform ID is extracted from the file path (e.g., '13857' from 'aoml/13857/13857_meta.nc').
+    This is the authoritative source for which institution deployed each float.
+    """
+    if not os.path.exists(META_INDEX_PATH):
+        print(f"WARNING: {META_INDEX_PATH} not found, skipping metadata sync")
+        return
+    
+    await db.execute('DELETE FROM metadata')  # Full refresh
+    
+    batch = []
+    count = 0
+    async with aiofiles.open(META_INDEX_PATH, mode='r', encoding='utf-8') as f:
+        async for line in f:
+            line = line.strip()
+            if line.startswith('#') or line.startswith('file,') or not line:
+                continue
+            parts = line.split(',')
+            if len(parts) >= 4:
+                try:
+                    # Extract platform ID from path like 'aoml/13857/13857_meta.nc'
+                    file_path = parts[0]
+                    path_parts = file_path.split('/')
+                    if len(path_parts) >= 2:
+                        platform = path_parts[1]  # e.g., '13857'
+                    else:
+                        continue
+                    profiler_type = parts[1].strip()
+                    institution = parts[2].strip()
+                    date_update = parts[3].strip()
+                    batch.append((platform, profiler_type, institution, date_update))
+                    count += 1
+                except (ValueError, IndexError):
+                    continue
+            
+            if len(batch) >= 5000:
+                await db.executemany('INSERT OR REPLACE INTO metadata VALUES (?,?,?,?)', batch)
+                batch = []
+    
+    if batch:
+        await db.executemany('INSERT OR REPLACE INTO metadata VALUES (?,?,?,?)', batch)
+    await db.commit()
+    print(f"Synced {count} metadata entries")
+
 async def ensure_index_files():
     """Downloads index files if missing or old."""
-    for url, path in [(REMOTE_INDEX_URL, LOCAL_INDEX_PATH), ('https://data-argo.ifremer.fr/argo_bio-profile_index.txt', BIO_INDEX_PATH)]:
+    for url, path in [
+        (REMOTE_INDEX_URL, LOCAL_INDEX_PATH), 
+        ('https://data-argo.ifremer.fr/argo_bio-profile_index.txt', BIO_INDEX_PATH),
+        (REMOTE_META_URL, META_INDEX_PATH)
+    ]:
         if not os.path.exists(path) or (time.time() - os.path.getmtime(path)) > 86400:
             print(f"Downloading {path}...")
             async with httpx.AsyncClient() as client:
@@ -201,7 +277,7 @@ async def db_query_profiles(start_date, end_date, ptype, bounds=None):
     start_str = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y%m%d") + "000000"
     end_str = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y%m%d") + "235959"
     
-    query = "SELECT * FROM profiles WHERE date BETWEEN ? AND ? AND type = ?"
+    query = "SELECT * FROM profiles WHERE date BETWEEN ? AND ? AND type = ? AND lat BETWEEN -90 AND 90 AND lon BETWEEN -180 AND 180"
     params = [start_str, end_str, ptype]
     
     if bounds:
@@ -704,18 +780,27 @@ async def get_active_floats(request: Request, startDate: Optional[str] = None, e
 
     ninety_days_ago = (end_dt - timedelta(days=90)).strftime("%Y%m%d%H%M%S")
 
-    query = """
+    query = '''
         SELECT * FROM (
             SELECT *, ROW_NUMBER() OVER(PARTITION BY REPLACE(SUBSTR(file, INSTR(file, '/') + 1), SUBSTR(file, INSTR(file, '_')), '') ORDER BY date DESC) as rn
             FROM profiles 
             WHERE date BETWEEN ? AND ?
+            AND lat BETWEEN -90 AND 90 
+            AND lon BETWEEN -180 AND 180
         ) WHERE rn = 1
-    """
+    '''
     
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(query, [start_str, end_str]) as cursor:
             rows = await cursor.fetchall()
+            
+    # Fetch all metadata into a dict for authoritative institution mapping
+    meta_dict = {}
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT platform, institution FROM metadata")
+        async for r in cursor:
+            meta_dict[r[0]] = r[1]
             
     active_floats = []
     ocean_counts = {}
@@ -728,6 +813,9 @@ async def get_active_floats(request: Request, startDate: Optional[str] = None, e
         platform, cycle = extract_metadata(filename)
         is_bgc = platform in BGC_PLATFORMS
         
+        # Use authoritative institution from metadata, fallback to profile index
+        inst = meta_dict.get(platform, row['institution'])
+        
         status = 'active' if row['date'] >= ninety_days_ago else 'inactive'
         
         f_data = {
@@ -736,7 +824,7 @@ async def get_active_floats(request: Request, startDate: Optional[str] = None, e
             'date': row['date'],
             'lat': row['lat'],
             'lon': row['lon'],
-            'institution': row['institution'],
+            'institution': inst,
             'ocean': row['ocean'],
             'type': 'bgc' if is_bgc else 'core',
             'status': status
@@ -747,11 +835,32 @@ async def get_active_floats(request: Request, startDate: Optional[str] = None, e
         else: core_count += 1
         
         o = row['ocean']
-        i = row['institution']
+        i = inst
         ocean_counts[o] = ocean_counts.get(o, 0) + 1
         inst_counts[i] = inst_counts.get(i, 0) + 1
 
     ocean_labels = {'I': 'Indian', 'P': 'Pacific', 'A': 'Atlantic', '': 'Unknown'}
+
+    # Get authoritative INCOIS float count from metadata table
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM metadata WHERE institution = 'IN'")
+        incois_total = (await cursor.fetchone())[0]
+    
+    # Also count how many of the currently visible floats are INCOIS
+    # Cross-reference platform IDs against the metadata table
+    platform_ids = list(set(f['platform'] for f in active_floats))
+    incois_visible = 0
+    if platform_ids:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Query in batches to avoid SQL parameter limits
+            for i in range(0, len(platform_ids), 500):
+                chunk = platform_ids[i:i+500]
+                placeholders = ','.join('?' * len(chunk))
+                cursor = await db.execute(
+                    f"SELECT COUNT(*) FROM metadata WHERE institution = 'IN' AND platform IN ({placeholders})",
+                    chunk
+                )
+                incois_visible += (await cursor.fetchone())[0]
 
     return {
         "count": len(active_floats), 
@@ -759,6 +868,8 @@ async def get_active_floats(request: Request, startDate: Optional[str] = None, e
         "bgc_count": bgc_count,
         "ocean_counts": {ocean_labels.get(k, k): v for k, v in sorted(ocean_counts.items(), key=lambda x: -x[1])},
         "inst_counts": dict(sorted(inst_counts.items(), key=lambda x: -x[1])),
+        "incois_total": incois_total,
+        "incois_visible": incois_visible,
         "floats": active_floats
     }
 
@@ -766,8 +877,8 @@ async def get_active_floats(request: Request, startDate: Optional[str] = None, e
 @limiter.limit("20/minute")
 async def get_trajectory(platform_id: str, request: Request):
     """Returns all historical positions for a given platform ID using SQLite."""
-    query = "SELECT date, lat, lon, file FROM profiles WHERE file LIKE ?"
-    pattern = f"%/{platform_id}_%"
+    query = "SELECT date, lat, lon, file FROM profiles WHERE file LIKE ? AND lat BETWEEN -90 AND 90 AND lon BETWEEN -180 AND 180"
+    pattern = f"%/{platform_id}/profiles/%"
     
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row

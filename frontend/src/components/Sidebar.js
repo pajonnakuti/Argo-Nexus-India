@@ -24,6 +24,17 @@ const Sidebar = ({
 
   const handleChange = (e) => {
     const { name, value } = e.target;
+    // For date inputs, only update state if the value is a valid YYYY-MM-DD date
+    // This prevents the React state from going out of sync when users type partial dates
+    if (name === 'startDate' || name === 'endDate') {
+      if (value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        return; // Ignore partial/invalid date strings
+      }
+      const dateObj = new Date(value);
+      if (value && isNaN(dateObj.getTime())) {
+        return; // Ignore invalid dates like 2026-02-31
+      }
+    }
     setParams({ ...params, [name]: value });
   };
 
@@ -96,18 +107,22 @@ const Sidebar = ({
         </div>
 
         {/* Mini Status Block */}
-        <div className="mini-status">
+        <div className="mini-status" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px' }}>
           <div className="stat-block">
-            <div className="stat-label">ACTIVE<br/>FLOATS</div>
-            <div className="stat-value">{floatCounts?.total?.toLocaleString() || '—'}</div>
+            <div className="stat-label" style={{ fontSize: '10px' }}>TOTAL IN<br/>RANGE</div>
+            <div className="stat-value">{floatCounts?.totalQueried?.toLocaleString() || '—'}</div>
           </div>
           <div className="stat-block">
-            <div className="stat-label">CORE</div>
-            <div className="stat-value core">{floatCounts?.core?.toLocaleString() || '—'}</div>
+            <div className="stat-label" style={{ fontSize: '10px' }}>TRULY<br/>ACTIVE</div>
+            <div className="stat-value" style={{ color: '#059669' }}>{floatCounts?.totalActive?.toLocaleString() || '—'}</div>
           </div>
           <div className="stat-block">
-            <div className="stat-label">BGC</div>
-            <div className="stat-value bgc">{floatCounts?.bgc?.toLocaleString() || '—'}</div>
+            <div className="stat-label" style={{ fontSize: '10px' }}>ACTIVE<br/>CORE</div>
+            <div className="stat-value core">{floatCounts?.activeCore?.toLocaleString() || '—'}</div>
+          </div>
+          <div className="stat-block">
+            <div className="stat-label" style={{ fontSize: '10px' }}>ACTIVE<br/>BGC</div>
+            <div className="stat-value bgc">{floatCounts?.activeBgc?.toLocaleString() || '—'}</div>
           </div>
         </div>
 
