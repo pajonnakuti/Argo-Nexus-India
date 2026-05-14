@@ -189,9 +189,10 @@ async def sync_index_to_db(db):
     
     for ptype, path in [('core', LOCAL_INDEX_PATH), ('bio', BIO_INDEX_PATH)]:
         print(f"Parsing {ptype} index...")
-        async with aiofiles.open(path, mode='r', encoding='utf-8') as f:
+        # Use synchronous file reading for massive speedup (avoids millions of async thread switches)
+        with open(path, mode='r', encoding='utf-8') as f:
             batch = []
-            async for line in f:
+            for line in f:
                 if line.startswith('#') or 'file,' in line:
                     continue
                 parts = line.split(',')
@@ -230,8 +231,9 @@ async def sync_metadata_to_db(db):
     
     batch = []
     count = 0
-    async with aiofiles.open(META_INDEX_PATH, mode='r', encoding='utf-8') as f:
-        async for line in f:
+    # Use synchronous file reading for speed
+    with open(META_INDEX_PATH, mode='r', encoding='utf-8') as f:
+        for line in f:
             line = line.strip()
             if line.startswith('#') or line.startswith('file,') or not line:
                 continue
