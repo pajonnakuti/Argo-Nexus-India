@@ -113,6 +113,7 @@ async def init_db():
         await db.execute('''
             CREATE TABLE IF NOT EXISTS profiles (
                 file TEXT PRIMARY KEY,
+                platform TEXT,
                 date TEXT,
                 lat REAL,
                 lon REAL,
@@ -134,6 +135,7 @@ async def init_db():
         await db.execute('CREATE INDEX IF NOT EXISTS idx_date ON profiles(date)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_type ON profiles(type)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_geo ON profiles(lat, lon)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_platform_date ON profiles(platform, date)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_meta_inst ON metadata(institution)')
         await db.commit()
 
@@ -195,18 +197,20 @@ async def sync_index_to_db(db):
                 parts = line.split(',')
                 if ptype == 'core' and len(parts) >= 8:
                     try:
-                        batch.append((parts[0], parts[1], float(parts[2]), float(parts[3]), parts[4], parts[5], parts[6], 'core'))
-                    except ValueError: continue
+                        platform = parts[0].split('/')[1]
+                        batch.append((parts[0], platform, parts[1], float(parts[2]), float(parts[3]), parts[4], parts[5], parts[6], 'core'))
+                    except (ValueError, IndexError): continue
                 elif ptype == 'bio' and len(parts) >= 7:
                     try:
-                        batch.append((parts[0], parts[1], float(parts[2]), float(parts[3]), parts[4], parts[5], parts[6], 'bio'))
-                    except ValueError: continue
+                        platform = parts[0].split('/')[1]
+                        batch.append((parts[0], platform, parts[1], float(parts[2]), float(parts[3]), parts[4], parts[5], parts[6], 'bio'))
+                    except (ValueError, IndexError): continue
                 
                 if len(batch) >= 5000:
-                    await db.executemany('INSERT OR REPLACE INTO profiles VALUES (?,?,?,?,?,?,?,?)', batch)
+                    await db.executemany('INSERT OR REPLACE INTO profiles VALUES (?,?,?,?,?,?,?,?,?)', batch)
                     batch = []
             if batch:
-                await db.executemany('INSERT OR REPLACE INTO profiles VALUES (?,?,?,?,?,?,?,?)', batch)
+                await db.executemany('INSERT OR REPLACE INTO profiles VALUES (?,?,?,?,?,?,?,?,?)', batch)
     await db.commit()
 
 async def sync_metadata_to_db(db):
@@ -780,9 +784,10 @@ async def get_active_floats(request: Request, startDate: Optional[str] = None, e
 
     ninety_days_ago = (end_dt - timedelta(days=90)).strftime("%Y%m%d%H%M%S")
 
+    # Optimized query leveraging the new platform column and compound index
     query = '''
         SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER(PARTITION BY REPLACE(SUBSTR(file, INSTR(file, '/') + 1), SUBSTR(file, INSTR(file, '_')), '') ORDER BY date DESC) as rn
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY platform ORDER BY date DESC) as rn
             FROM profiles 
             WHERE date BETWEEN ? AND ?
             AND lat BETWEEN -90 AND 90 

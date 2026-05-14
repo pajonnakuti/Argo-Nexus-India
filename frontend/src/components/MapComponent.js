@@ -321,7 +321,6 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
           };
           setFloatCounts(counts);
           if (onFloatCountsUpdate) onFloatCountsUpdate(counts);
-        }
       })
       .catch(err => console.error("Failed to load active floats:", err))
       .finally(() => setIsMapLoading(false));
