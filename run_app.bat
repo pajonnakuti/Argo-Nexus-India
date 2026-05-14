@@ -10,7 +10,7 @@ taskkill /F /IM node.exe /T >nul 2>&1
 cd /d "%~dp0"
 
 echo [2/3] Starting Backend Server (Uvicorn)...
-start "Argo-Nexus-Backend" cmd /k "cd backend && uvicorn main:app --reload"
+start "Argo-Nexus-Backend" cmd /k "cd backend && python -m uvicorn main:app --reload"
 
 echo [3/3] Starting Frontend Server (React)...
 start "Argo-Nexus-Frontend" cmd /k "cd frontend && npm start"
