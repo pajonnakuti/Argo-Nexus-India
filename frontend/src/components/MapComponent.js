@@ -25,7 +25,7 @@ const INST_LABELS = {
   'KM': 'KORDI', 'KO': 'KO', 'NM': 'NM'
 };
 
-const ActiveFloatsControl = ({ showActive, setShowActive, floatFilter, setFloatFilter, oceanFilter, setOceanFilter, instFilter, setInstFilter, floatCounts, parameterCounts }) => {
+const ActiveFloatsControl = ({ showActive, setShowActive, showInactive, setShowInactive, floatFilter, setFloatFilter, oceanFilter, setOceanFilter, instFilter, setInstFilter, floatCounts, parameterCounts }) => {
   const map = useMap();
 
   useEffect(() => {
@@ -73,6 +73,11 @@ const ActiveFloatsControl = ({ showActive, setShowActive, floatFilter, setFloatF
               </div>
               <div class="filter-option ${floatFilter === 'bgc' ? 'selected' : ''}" data-filter="bgc">
                 BGC (${floatCounts.bgc})
+              </div>
+              <div class="filter-divider"></div>
+              <div class="filter-section-label">Status</div>
+              <div class="filter-option ${showInactive ? 'selected' : ''}" id="toggle-inactive">
+                ${showInactive ? 'Hide' : 'Show'} Inactive Floats (>90 days)
               </div>
               <div class="filter-divider"></div>
               <div class="filter-section-label">Ocean</div>
@@ -137,6 +142,16 @@ const ActiveFloatsControl = ({ showActive, setShowActive, floatFilter, setFloatF
           };
         });
 
+        // Inactive floats toggle
+        const toggleInactive = container.querySelector('#toggle-inactive');
+        if (toggleInactive) {
+          toggleInactive.onclick = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setShowInactive(!showInactive);
+          };
+        }
+
         L.DomEvent.disableClickPropagation(container);
         L.DomEvent.disableScrollPropagation(container);
         return container;
@@ -146,7 +161,7 @@ const ActiveFloatsControl = ({ showActive, setShowActive, floatFilter, setFloatF
     const control = new CustomControl();
     map.addControl(control);
     return () => map.removeControl(control);
-  }, [map, showActive, setShowActive, floatFilter, setFloatFilter, oceanFilter, setOceanFilter, instFilter, setInstFilter, floatCounts]);
+  }, [map, showActive, setShowActive, showInactive, setShowInactive, floatFilter, setFloatFilter, oceanFilter, setOceanFilter, instFilter, setInstFilter, floatCounts]);
 
   return null;
 };
@@ -210,13 +225,14 @@ const MapPanner = ({ center }) => {
 };
 
 // ── Main MapComponent ─────────────────────────────────────────────────────────
-const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate }) => {
+const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, endDate }) => {
   const mapRef = useRef();
   const featureGroupRef = useRef();
 
   const [is3D, setIs3D] = useState(false);
   const [activeFloats, setActiveFloats] = useState([]);
   const [showActive, setShowActive] = useState(false);
+  const [showInactive, setShowInactive] = useState(false);
   const [floatFilter, setFloatFilter] = useState('all');
   const [oceanFilter, setOceanFilter] = useState('all');
   const [instFilter, setInstFilter] = useState('all');
@@ -270,9 +286,15 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate }) => {
   const [trajLoading, setTrajLoading] = useState(false);
   const [panCenter, setPanCenter] = useState(null);
 
-  // Fetch active floats once
+  // Fetch active floats when dates change
   useEffect(() => {
-    fetch('http://localhost:8000/api/active_floats')
+    let url = 'http://localhost:8000/api/active_floats';
+    const queryParams = new URLSearchParams();
+    if (startDate) queryParams.append('startDate', startDate);
+    if (endDate) queryParams.append('endDate', endDate);
+    if (queryParams.toString()) url += `?${queryParams.toString()}`;
+
+    fetch(url)
       .then(res => res.json())
       .then(data => {
         if (data && data.floats) {
@@ -289,7 +311,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate }) => {
         }
       })
       .catch(err => console.error("Failed to load active floats:", err));
-  }, []);
+  }, [startDate, endDate]);
 
   // Sync bounding-box rectangle
   useEffect(() => {
@@ -437,6 +459,8 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate }) => {
         <ActiveFloatsControl
           showActive={showActive}
           setShowActive={setShowActive}
+          showInactive={showInactive}
+          setShowInactive={setShowInactive}
           floatFilter={floatFilter}
           setFloatFilter={setFloatFilter}
           oceanFilter={oceanFilter}
@@ -503,6 +527,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate }) => {
         {showActive && activeFloats
           .filter(f => {
             if (floatFilter !== 'all' && f.type !== floatFilter) return false;
+            if (!showInactive && f.status === 'inactive') return false;
             if (oceanFilter !== 'all') {
               const oceanLabels = {'I': 'Indian', 'P': 'Pacific', 'A': 'Atlantic', '': 'Unknown'};
               if ((oceanLabels[f.ocean] || f.ocean) !== oceanFilter) return false;
@@ -517,17 +542,36 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate }) => {
               displayDate = `${rawDate.slice(0,4)}-${rawDate.slice(4,6)}-${rawDate.slice(6,8)}`;
             }
             const isSelected = selectedFloat?.platform === float.platform;
+            const isInactive = float.status === 'inactive';
+
+            let color = float.type === 'bgc' ? '#7c3aed' : '#ca8a04';
+            let fillColor = float.type === 'bgc' ? '#c084fc' : '#fef08a';
+            let radius = 5;
+            let fillOpacity = 0.9;
+            let weight = 1;
+
+            if (isSelected) {
+                color = '#f97316';
+                fillColor = '#fed7aa';
+                radius = 9;
+                weight = 2.5;
+            } else if (isInactive) {
+                color = '#64748b';
+                fillColor = '#cbd5e1';
+                radius = 4;
+                fillOpacity = 0.5;
+            }
 
             return (
               <CircleMarker
                 key={float.platform}
                 center={[float.lat, float.lon]}
-                radius={isSelected ? 9 : 5}
+                radius={radius}
                 pathOptions={{
-                  color: isSelected ? '#f97316' : (float.type === 'bgc' ? '#7c3aed' : '#ca8a04'),
-                  weight: isSelected ? 2.5 : 1,
-                  fillColor: isSelected ? '#fed7aa' : (float.type === 'bgc' ? '#c084fc' : '#fef08a'),
-                  fillOpacity: 0.9
+                  color: color,
+                  weight: weight,
+                  fillColor: fillColor,
+                  fillOpacity: fillOpacity
                 }}
                 eventHandlers={{
                   click: () => handleFloatClick(float),
@@ -535,7 +579,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate }) => {
               >
                 <Tooltip direction="top" offset={[0, -6]} opacity={0.92}>
                   <div className="traj-tooltip">
-                    <strong>{float.platform}</strong>
+                    <strong>{float.platform} {isInactive ? '(Inactive)' : ''}</strong>
                     <div>{float.type?.toUpperCase()} · {displayDate}</div>
                     <div>{float.lat.toFixed(3)}°, {float.lon.toFixed(3)}°</div>
                     <div style={{ color: '#93c5fd', fontSize: '0.7rem', marginTop: 2 }}>Click to view trajectory</div>

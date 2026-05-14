@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+httpx
+pandas
+numpy
+xarray
+netCDF4
+scipy
+websockets
+uvicorn[standard]
+diskcache
+filelock
+slowapi
+aiofiles
+aiosqlite
+duckdb
+pyarrow

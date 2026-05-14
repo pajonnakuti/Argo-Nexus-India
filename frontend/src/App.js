@@ -47,13 +47,34 @@ function App() {
 
     const fmt = format || downloadFormat;
     setLoading(true);
-    setLogs([`Exporting data as ${fmt.toUpperCase()}...`]);
+    setLogs([`Exporting data as ${fmt === 'diva' ? 'DIVA Gridded NetCDF' : fmt.toUpperCase()}...`]);
 
     try {
-      const response = await fetch(`http://localhost:8000/api/export/${fmt}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      // Build request body based on format
+      let url, body;
+
+      if (fmt === 'diva') {
+        url = 'http://localhost:8000/api/export/diva';
+        body = {
+          bounds,
+          params: {
+            startDate: params.startDate,
+            endDate: params.endDate,
+            minDepth: params.minDepth,
+            maxDepth: params.maxDepth,
+            type: params.type,
+          },
+          variable: gridConfig.variable,
+          depth_level: gridConfig.depth_level,
+          depth_tolerance: gridConfig.depth_tolerance,
+          resolution: gridConfig.resolution,
+          method: gridConfig.method,
+          corr_length: gridConfig.corr_length,
+          snr: gridConfig.snr,
+        };
+      } else {
+        url = `http://localhost:8000/api/export/${fmt}`;
+        body = {
           bounds,
           params: {
             startDate: params.startDate,
@@ -63,7 +84,13 @@ function App() {
             type: params.type,
           },
           selectedVars: params.selectedVars
-        })
+        };
+      }
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
       });
 
       if (!response.ok) {
@@ -73,23 +100,24 @@ function App() {
 
       // Determine filename from Content-Disposition header
       const disposition = response.headers.get('Content-Disposition');
-      let filename = `argo_export.${fmt}`;
+      let filename = fmt === 'diva' ? `argo_diva_${gridConfig.variable}.nc` : `argo_export.${fmt}`;
       if (disposition) {
         const match = disposition.match(/filename="?([^"]+)"?/);
         if (match) filename = match[1];
       }
 
       const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
+      const blobUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
-      link.href = url;
+      link.href = blobUrl;
       link.setAttribute('download', filename);
       document.body.appendChild(link);
       link.click();
       link.remove();
-      window.URL.revokeObjectURL(url);
+      window.URL.revokeObjectURL(blobUrl);
 
-      setLogs(prev => [...prev, `✅ ${fmt.toUpperCase()} download complete: ${filename}`]);
+      const label = fmt === 'diva' ? 'DIVA Gridded NetCDF' : fmt.toUpperCase();
+      setLogs(prev => [...prev, `✅ ${label} download complete: ${filename}`]);
       
       // Show preview for CSV format
       if (fmt === 'csv') {
@@ -220,8 +248,13 @@ function App() {
         onExport={handleExport}
       />
       <div className="map-container">
-        <MapComponent onBoundsChange={setBounds} bounds={bounds} onFloatCountsUpdate={setFloatCounts} />
-        
+        <MapComponent 
+          onBoundsChange={setBounds} 
+          bounds={bounds} 
+          onFloatCountsUpdate={setFloatCounts}
+          startDate={params.startDate}
+          endDate={params.endDate}
+        />
         {/* Grid visualization overlay */}
         {gridData && (
           <GridPreview

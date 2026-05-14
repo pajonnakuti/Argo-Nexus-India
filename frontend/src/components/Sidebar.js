@@ -306,16 +306,103 @@ const Sidebar = ({
           Export Format
         </div>
         <div className="format-selector">
-          {['csv', 'json', 'netcdf'].map(fmt => (
+          {['csv', 'json', 'netcdf', 'diva'].map(fmt => (
             <button
               key={fmt}
-              className={`format-btn ${downloadFormat === fmt ? 'active' : ''}`}
+              className={`format-btn ${downloadFormat === fmt ? 'active' : ''} ${fmt === 'diva' ? 'diva-btn' : ''}`}
               onClick={() => setDownloadFormat(fmt)}
             >
-              {fmt === 'netcdf' ? 'NetCDF' : fmt.toUpperCase()}
+              {fmt === 'netcdf' ? 'NetCDF' : fmt === 'diva' ? 'DIVA Grid' : fmt.toUpperCase()}
             </button>
           ))}
         </div>
+
+        {/* Inline DIVA config when DIVA format is selected */}
+        {downloadFormat === 'diva' && (
+          <div className="diva-inline-config">
+            <div className="diva-config-note">
+              DIVA Optimal Interpolation produces a gridded NetCDF with analysis + error fields
+            </div>
+            <div className="input-group">
+              <span className="input-label">Variable</span>
+              <select
+                className="input-field"
+                value={gridConfig.variable}
+                onChange={e => setGridConfig({ ...gridConfig, variable: e.target.value })}
+              >
+                {gridVars.map(v => <option key={v} value={v}>{v}</option>)}
+              </select>
+            </div>
+            <div className="grid-2">
+              <div className="input-group">
+                <span className="input-label">Depth (m)</span>
+                <input
+                  type="number"
+                  className="input-field"
+                  value={gridConfig.depth_level}
+                  onChange={e => setGridConfig({ ...gridConfig, depth_level: parseFloat(e.target.value) || 0 })}
+                />
+              </div>
+              <div className="input-group">
+                <span className="input-label">Tolerance (m)</span>
+                <input
+                  type="number"
+                  className="input-field"
+                  value={gridConfig.depth_tolerance}
+                  onChange={e => setGridConfig({ ...gridConfig, depth_tolerance: parseFloat(e.target.value) || 50 })}
+                />
+              </div>
+            </div>
+            <div className="input-group">
+              <span className="input-label">Resolution</span>
+              <div className="format-selector">
+                {resolutionOptions.map(r => (
+                  <button
+                    key={r}
+                    className={`format-btn ${gridConfig.resolution === r ? 'active' : ''}`}
+                    onClick={() => setGridConfig({ ...gridConfig, resolution: r })}
+                  >
+                    {r}&deg;
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="input-group">
+              <span className="input-label">Method</span>
+              <select
+                className="input-field"
+                value={gridConfig.method}
+                onChange={e => setGridConfig({ ...gridConfig, method: e.target.value })}
+              >
+                {methodOptions.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+              </select>
+            </div>
+            {gridConfig.method === 'oi' && (
+              <div className="grid-2">
+                <div className="input-group">
+                  <span className="input-label">Corr. Length (&deg;)</span>
+                  <input
+                    type="number"
+                    step="0.5"
+                    className="input-field"
+                    value={gridConfig.corr_length}
+                    onChange={e => setGridConfig({ ...gridConfig, corr_length: parseFloat(e.target.value) || 2.0 })}
+                  />
+                </div>
+                <div className="input-group">
+                  <span className="input-label">SNR</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    className="input-field"
+                    value={gridConfig.snr}
+                    onChange={e => setGridConfig({ ...gridConfig, snr: parseFloat(e.target.value) || 1.0 })}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <button className="btn-primary" onClick={onSubmit}>
@@ -324,7 +411,10 @@ const Sidebar = ({
           <polyline points="7 10 12 15 17 10" />
           <line x1="12" y1="15" x2="12" y2="3" />
         </svg>
-        {'Export as ' + (downloadFormat === 'netcdf' ? 'NetCDF' : downloadFormat.toUpperCase())}
+        {downloadFormat === 'diva'
+          ? `Export DIVA Gridded (${gridConfig.variable})`
+          : 'Export as ' + (downloadFormat === 'netcdf' ? 'NetCDF' : downloadFormat.toUpperCase())
+        }
       </button>
 
       {/* ── Section Divider ── */}

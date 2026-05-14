@@ -35,7 +35,9 @@ def optimal_interpolation(lons, lats, values, grid_lon, grid_lat,
 
     Returns
     -------
-    2-D numpy array of interpolated values on the grid
+    (analysis, error) : tuple of 2-D numpy arrays
+        analysis — interpolated field on the grid
+        error    — DIVA error field (0 = perfect, 1 = no data influence)
     """
     obs_points = np.column_stack([lons, lats])
     grid_points = np.column_stack([grid_lon.ravel(), grid_lat.ravel()])
@@ -43,7 +45,7 @@ def optimal_interpolation(lons, lats, values, grid_lon, grid_lat,
     n_obs = len(values)
 
     if n_obs == 0:
-        return np.full(grid_lon.shape, np.nan)
+        return np.full(grid_lon.shape, np.nan), np.ones(grid_lon.shape)
 
     if n_obs > 5000:
         # For large datasets, fall back to RBF for performance
@@ -59,19 +61,11 @@ def optimal_interpolation(lons, lats, values, grid_lon, grid_lat,
     noise_var = 1.0 / max(snr, 0.01)
     C_obs += noise_var * np.eye(n_obs)
 
-    # Solve for weights: C_obs * w = c_grid for each grid point
-    try:
-        C_obs_inv = np.linalg.solve(C_obs, values)
-    except np.linalg.LinAlgError:
-        # Fall back to least squares if singular
-        C_obs_inv, _, _, _ = np.linalg.lstsq(C_obs, values, rcond=None)
-
-    # Compute analysis at each grid point
+    # Compute cross-correlation between grid points and observations
     grid_dist = cdist(grid_points, obs_points, metric='euclidean')
     C_grid = np.exp(-(grid_dist ** 2) / (2.0 * corr_length ** 2))
 
-    # Analysed field = C_grid * C_obs_inv(values)
-    # Re-derive properly: analysis = C_grid @ inv(C_obs) @ values
+    # Solve for weights: analysis = C_grid @ inv(C_obs) @ values
     try:
         weights = np.linalg.solve(C_obs, values)
         analysis = C_grid @ weights
@@ -79,13 +73,33 @@ def optimal_interpolation(lons, lats, values, grid_lon, grid_lat,
         weights, _, _, _ = np.linalg.lstsq(C_obs, values, rcond=None)
         analysis = C_grid @ weights
 
-    return analysis.reshape(grid_lon.shape)
+    # ── DIVA Error Field ──────────────────────────────────────────────
+    # error² = 1 - diag(C_grid @ inv(C_obs) @ C_grid^T)
+    # For each grid point g:  err(g) = 1 - c_g^T @ C_obs^{-1} @ c_g
+    # We compute inv(C_obs) @ C_grid^T column-by-column
+    try:
+        W = np.linalg.solve(C_obs, C_grid.T)          # shape: (n_obs, n_grid)
+        # diag(C_grid @ W) = sum of element-wise product along obs axis
+        error_sq = 1.0 - np.sum(C_grid * W.T, axis=1)  # shape: (n_grid,)
+    except np.linalg.LinAlgError:
+        W, _, _, _ = np.linalg.lstsq(C_obs, C_grid.T, rcond=None)
+        error_sq = 1.0 - np.sum(C_grid * W.T, axis=1)
+
+    # Clamp to [0, 1] (numerical noise can push slightly outside)
+    error_sq = np.clip(error_sq, 0.0, 1.0)
+    error_field = np.sqrt(error_sq)
+
+    return analysis.reshape(grid_lon.shape), error_field.reshape(grid_lon.shape)
 
 
 def _rbf_interpolation(lons, lats, values, grid_lon, grid_lat, corr_length):
     """
     RBF-based interpolation for large datasets.
     Uses scipy.interpolate.RBFInterpolator for scalable performance.
+
+    Returns
+    -------
+    (analysis, error) : tuple of 2-D numpy arrays
     """
     obs_points = np.column_stack([lons, lats])
     grid_points = np.column_stack([grid_lon.ravel(), grid_lat.ravel()])
@@ -97,11 +111,28 @@ def _rbf_interpolation(lons, lats, values, grid_lon, grid_lat, corr_length):
             epsilon=1.0 / max(corr_length, 0.1),
             smoothing=0.1
         )
-        result = rbf(grid_points)
-        return result.reshape(grid_lon.shape)
+        result = rbf(grid_points).reshape(grid_lon.shape)
+
+        # Estimate error from distance to nearest observation
+        error_field = _distance_based_error(obs_points, grid_points, corr_length)
+        return result, error_field.reshape(grid_lon.shape)
     except Exception:
         # Ultimate fallback
         return fallback_griddata(lons, lats, values, grid_lon, grid_lat, 'linear')
+
+
+def _distance_based_error(obs_points, grid_points, corr_length):
+    """
+    Estimate error field from distance to nearest observation.
+    Uses the same Gaussian decay as OI: error ≈ exp(-d_min / (2*L)).
+    Points far from any observation get error close to 1.
+    """
+    from scipy.spatial import cKDTree
+    tree = cKDTree(obs_points)
+    d_min, _ = tree.query(grid_points)
+    # Normalise: error = 1 - exp(-d² / (2*L²))
+    error = 1.0 - np.exp(-(d_min ** 2) / (2.0 * corr_length ** 2))
+    return np.clip(error, 0.0, 1.0)
 
 
 def fallback_griddata(lons, lats, values, grid_lon, grid_lat, method='linear'):
@@ -111,10 +142,23 @@ def fallback_griddata(lons, lats, values, grid_lon, grid_lat, method='linear'):
     Parameters
     ----------
     method : 'linear', 'nearest', or 'cubic'
+
+    Returns
+    -------
+    (analysis, error) : tuple of 2-D numpy arrays
     """
-    points = np.column_stack([lons, lats])
-    result = griddata(points, values, (grid_lon, grid_lat), method=method)
-    return result
+    obs_points = np.column_stack([lons, lats])
+    grid_points = np.column_stack([grid_lon.ravel(), grid_lat.ravel()])
+    result = griddata(obs_points, values, (grid_lon, grid_lat), method=method)
+
+    # For non-OI methods, estimate error from data density
+    error_field = _distance_based_error(obs_points, grid_points, corr_length=2.0)
+    # Where griddata returned NaN (outside convex hull), set error to 1
+    nan_mask = np.isnan(result)
+    error_field = error_field.reshape(grid_lon.shape)
+    error_field[nan_mask] = 1.0
+
+    return result, error_field
 
 
 def grid_argo_data(profiles_data, variable, bounds, depth_level=10.0,
@@ -224,28 +268,31 @@ def grid_argo_data(profiles_data, variable, bounds, depth_level=10.0,
 
     # --- Interpolate ---
     if method == 'oi':
-        gridded = optimal_interpolation(
+        gridded, error_field = optimal_interpolation(
             lons, lats, vals, grid_lon, grid_lat,
             corr_length=corr_length, snr=snr
         )
     elif method in ('linear', 'nearest', 'cubic'):
-        gridded = fallback_griddata(lons, lats, vals, grid_lon, grid_lat, method)
+        gridded, error_field = fallback_griddata(lons, lats, vals, grid_lon, grid_lat, method)
     else:
-        gridded = fallback_griddata(lons, lats, vals, grid_lon, grid_lat, 'linear')
+        gridded, error_field = fallback_griddata(lons, lats, vals, grid_lon, grid_lat, 'linear')
 
     # --- Build xarray Dataset ---
+    error_var = f'{variable}_error'
     ds = xr.Dataset(
         {
             variable: (['lat', 'lon'], gridded.astype(np.float32)),
+            error_var: (['lat', 'lon'], error_field.astype(np.float32)),
         },
         coords={
             'lat': grid_lats,
             'lon': grid_lons,
         },
         attrs={
-            'title': f'Argo Nexus Gridded {variable}',
+            'title': f'Argo Nexus DIVA Gridded {variable}',
             'source': 'Argo Nexus India — DIVA-style Optimal Interpolation',
             'institution': 'INCOIS / Argo Nexus',
+            'references': 'Troupin et al. (2012), doi:10.1016/j.advwatres.2012.02.008',
             'variable': variable,
             'depth_level_dbar': depth_level,
             'depth_tolerance_dbar': depth_tolerance,
@@ -269,6 +316,13 @@ def grid_argo_data(profiles_data, variable, bounds, depth_level=10.0,
     ds[variable].attrs = {
         'long_name': _variable_long_names().get(variable, variable),
         'units': _variable_units().get(variable, 'unknown'),
+    }
+    ds[error_var].attrs = {
+        'long_name': f'DIVA Interpolation Error for {_variable_long_names().get(variable, variable)}',
+        'units': '1',
+        'valid_min': 0.0,
+        'valid_max': 1.0,
+        'comment': '0 = data-rich (low error), 1 = no nearby observations (high error)',
     }
 
     return ds

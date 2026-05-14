@@ -1,0 +1,7 @@
+argo_index.db
+cache/
+downloads/
+*.txt
+!requirements.txt
+__pycache__/
+data/

@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, Body, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Body, WebSocket, WebSocketDisconnect, Request
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from gridding import grid_argo_data
@@ -16,12 +18,77 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import List, Optional
 from pydantic import BaseModel
 import xarray as xr
+import diskcache
+import aiofiles
+import aiosqlite
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from filelock import FileLock
+import hashlib
+import shutil
 
-app = FastAPI()
+async def cleanup_task():
+    """Background task to enforce 20GB size limit on downloads directory (LRU)."""
+    MAX_SIZE = 20 * 1024 * 1024 * 1024 # 20 GB
+    while True:
+        try:
+            total_size = 0
+            files = []
+            for f in os.listdir(DOWNLOADS_DIR):
+                path = os.path.join(DOWNLOADS_DIR, f)
+                if os.path.isfile(path) and not path.endswith('.tmp') and not path.endswith('.lock'):
+                    stat = os.stat(path)
+                    total_size += stat.st_size
+                    files.append((path, stat.st_atime))
+            
+            if total_size > MAX_SIZE:
+                # Sort by access time (oldest first)
+                files.sort(key=lambda x: x[1])
+                bytes_to_free = total_size - MAX_SIZE + (1 * 1024 * 1024 * 1024) # Free down to 19GB
+                freed = 0
+                for path, _ in files:
+                    if freed >= bytes_to_free:
+                        break
+                    try:
+                        size = os.path.getsize(path)
+                        os.remove(path)
+                        freed += size
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Cleanup task error: {e}")
+        
+        await asyncio.sleep(3600) # Run every hour
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global HTTP_CLIENT
+    HTTP_CLIENT = httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+        timeout=httpx.Timeout(120.0, connect=30.0),
+    )
+    await init_db()
+    task = asyncio.create_task(cleanup_task())
+    yield
+    task.cancel()
+    if HTTP_CLIENT:
+        await HTTP_CLIENT.aclose()
+    PROCESS_POOL.shutdown(wait=False)
+
+app = FastAPI(lifespan=lifespan)
+
+# Rate Limiting setup
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS Restriction (use env var or default to localhost)
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,19 +102,132 @@ BIO_INDEX_PATH = 'argo_bio-profile_index.txt'
 # Ensure downloads directory exists
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-#Cached Core and Bio Profiles
-CACHED_PROFILES_BIO = []
-DATE_SORTED_PROFILES_BIO = []
-CACHED_PROFILES_CORE = []
-DATE_SORTED_PROFILES_CORE = []
+# Global BGC Platforms set (still useful for quick lookup, loaded from DB)
 BGC_PLATFORMS = set()
+
+async def init_db():
+    """Initializes SQLite database and syncs from .txt files if needed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS profiles (
+                file TEXT PRIMARY KEY,
+                date TEXT,
+                lat REAL,
+                lon REAL,
+                ocean TEXT,
+                profiler_type TEXT,
+                institution TEXT,
+                type TEXT
+            )
+        ''')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_date ON profiles(date)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_type ON profiles(type)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_geo ON profiles(lat, lon)')
+        await db.commit()
+
+        # Check if we need to sync
+        cursor = await db.execute('SELECT COUNT(*) FROM profiles')
+        count = (await cursor.fetchone())[0]
+        
+        # Simple heuristic: if DB is empty or txt files are newer, sync
+        needs_sync = count == 0
+        if not needs_sync:
+            for path in [LOCAL_INDEX_PATH, BIO_INDEX_PATH]:
+                if os.path.exists(path) and os.path.getmtime(path) > os.path.getmtime(DB_PATH):
+                    needs_sync = True
+                    break
+        
+        if needs_sync:
+            print("Syncing SQLite DB from index files...")
+            await sync_index_to_db(db)
+            
+        # Load BGC platforms into memory for quick lookup
+        cursor = await db.execute("SELECT DISTINCT REPLACE(SUBSTR(file, INSTR(file, '/') + 1), SUBSTR(file, INSTR(file, '_')), '') FROM profiles WHERE type='bio'")
+        async for row in cursor:
+            # This is a bit complex via SQL, easier to just regex the filenames if needed, 
+            # but let's just populate BGC_PLATFORMS from the 'bio' entries
+            pass
+        
+        # Better: just populate BGC_PLATFORMS by scanning bio entries once
+        cursor = await db.execute("SELECT file FROM profiles WHERE type='bio'")
+        async for row in cursor:
+            filename = os.path.basename(row[0])
+            match = re.search(r'([A-Z]*)([0-9]+)_([0-9]+D?)', filename)
+            if match:
+                BGC_PLATFORMS.add(match.group(2))
+        print(f"Loaded {len(BGC_PLATFORMS)} BGC platforms")
+
+async def sync_index_to_db(db):
+    """Parses .txt files and inserts into SQLite."""
+    # Ensure files exist (download if not)
+    await ensure_index_files()
+    
+    for ptype, path in [('core', LOCAL_INDEX_PATH), ('bio', BIO_INDEX_PATH)]:
+        print(f"Parsing {ptype} index...")
+        async with aiofiles.open(path, mode='r', encoding='utf-8') as f:
+            batch = []
+            async for line in f:
+                if line.startswith('#') or 'file,' in line:
+                    continue
+                parts = line.split(',')
+                if ptype == 'core' and len(parts) >= 8:
+                    try:
+                        batch.append((parts[0], parts[1], float(parts[2]), float(parts[3]), parts[4], parts[5], parts[6], 'core'))
+                    except ValueError: continue
+                elif ptype == 'bio' and len(parts) >= 7:
+                    try:
+                        batch.append((parts[0], parts[1], float(parts[2]), float(parts[3]), parts[4], parts[5], parts[6], 'bio'))
+                    except ValueError: continue
+                
+                if len(batch) >= 5000:
+                    await db.executemany('INSERT OR REPLACE INTO profiles VALUES (?,?,?,?,?,?,?,?)', batch)
+                    batch = []
+            if batch:
+                await db.executemany('INSERT OR REPLACE INTO profiles VALUES (?,?,?,?,?,?,?,?)', batch)
+    await db.commit()
+
+async def ensure_index_files():
+    """Downloads index files if missing or old."""
+    for url, path in [(REMOTE_INDEX_URL, LOCAL_INDEX_PATH), ('https://data-argo.ifremer.fr/argo_bio-profile_index.txt', BIO_INDEX_PATH)]:
+        if not os.path.exists(path) or (time.time() - os.path.getmtime(path)) > 86400:
+            print(f"Downloading {path}...")
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=600.0)
+                async with aiofiles.open(path, mode='w', encoding='utf-8') as f:
+                    await f.write(resp.text)
+
+async def db_query_profiles(start_date, end_date, ptype, bounds=None):
+    """Queries the SQLite database for profiles."""
+    start_str = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y%m%d") + "000000"
+    end_str = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y%m%d") + "235959"
+    
+    query = "SELECT * FROM profiles WHERE date BETWEEN ? AND ? AND type = ?"
+    params = [start_str, end_str, ptype]
+    
+    if bounds:
+        query += " AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?"
+        params.extend([bounds['south'], bounds['north'], bounds['west'], bounds['east']])
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
 
 # ── Shared HTTP client & Process Pool ─────────────────────────────────────────
 HTTP_CLIENT: httpx.AsyncClient = None
-PROCESS_POOL = ProcessPoolExecutor(max_workers=6)
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(48)
-BATCH_CHUNK_SIZE = 200  # profiles per processing chunk
+PROCESS_POOL = ProcessPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) + 4))
+EXTRACTION_SEMAPHORE = asyncio.Semaphore(min(16, (os.cpu_count() or 4) * 2))
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(100) # Global download limit
+MAX_PROFILES_PER_REQUEST = 5000
+BATCH_CHUNK_SIZE = 100  # Smaller chunks for better streaming
 MAX_DOWNLOAD_RETRIES = 3
+
+# Cache and DB paths
+CACHE_DIR = 'cache'
+DB_PATH = 'argo_index.db'
+os.makedirs(CACHE_DIR, exist_ok=True)
+cache = diskcache.Cache(CACHE_DIR, size_limit=20 * 1024 * 1024 * 1024) # 20GB limit
 
 
 class SearchParams(BaseModel):
@@ -82,173 +262,57 @@ class ExportRequest(BaseModel):
     bounds: Bounds
     params: SearchParams
     selectedVars: Optional[List[str]] = None
-async def load_bio_index():
-    "loads the index file from the bio link and sorts it for binary search"
-    global CACHED_PROFILES_BIO, DATE_SORTED_PROFILES_BIO
 
-    if CACHED_PROFILES_BIO:
-        return
-    # Check if local file exists and is less than 24 hours old
-    is_fresh = False
-    if os.path.exists(BIO_INDEX_PATH):
-        if (time.time() - os.path.getmtime(BIO_INDEX_PATH)) < 86400:
-            is_fresh = True
-            
-    content = ""
-    if is_fresh:
-        with open(BIO_INDEX_PATH, 'r', encoding='utf-8') as f:
-            content = f.read()
-    else:
-        print(f"Downloading completely fresh {BIO_INDEX_PATH}...")
-        async with httpx.AsyncClient() as client:
-            resp = await client.get('https://data-argo.ifremer.fr/argo_bio-profile_index.txt', timeout=600.0)
-            content = resp.text
-            with open(BIO_INDEX_PATH, 'w', encoding='utf-8') as f:
-                f.write(content)
+class DivaExportRequest(BaseModel):
+    bounds: Bounds
+    params: SearchParams
+    variable: str = 'TEMP'
+    depth_level: float = 10.0
+    depth_tolerance: float = 50.0
+    resolution: float = 0.5
+    method: str = 'oi'
+    corr_length: float = 2.0
+    snr: float = 1.0
 
-    # Parse the bio index content (10-column format: file,date,lat,lon,ocean,profiler_type,institution,parameters,parameter_data_mode,date_update)
-    lines = [line for line in content.splitlines() if not line.startswith('#') and 'file,' not in line]
 
-    data = []
-    for line in lines:
-        parts = line.split(',')
-        if len(parts) >= 7:
-            try:
-                data.append({
-                    'file': parts[0],
-                    'date': parts[1],
-                    'lat': float(parts[2]),
-                    'lon': float(parts[3]),
-                    'ocean': parts[4],
-                    'profiler_type': parts[5],
-                    'institution': parts[6],
-                    'date_update': parts[-1] if len(parts) >= 10 else parts[7] if len(parts) >= 8 else ''
-                })
-            except ValueError:
-                continue
-
-    CACHED_PROFILES_BIO = data
-    DATE_SORTED_PROFILES_BIO = sorted(data, key=lambda x: x['date'])
-    
-    # Store BGC platforms for quick lookup
-    global BGC_PLATFORMS
-    for prof in data:
-        filename = os.path.basename(prof['file'])
-        match = re.search(r'([A-Z]*)([0-9]+)_([0-9]+D?)', filename)
-        if match:
-            BGC_PLATFORMS.add(match.group(2))
-            
-    print(f'Loaded {len(CACHED_PROFILES_BIO)} bio profiles')
-
-async def load_index():
-    """Loads the core index file into memory and sorts it for binary search."""
-    global CACHED_PROFILES_CORE, DATE_SORTED_PROFILES_CORE
-
-    if CACHED_PROFILES_CORE:
-        return
-
-    # Check if local file exists and is less than 24 hours old
-    is_fresh = False
-    if os.path.exists(LOCAL_INDEX_PATH):
-        if (time.time() - os.path.getmtime(LOCAL_INDEX_PATH)) < 86400:
-            is_fresh = True
-
-    content = ""
-    if is_fresh:
-        with open(LOCAL_INDEX_PATH, 'r', encoding='utf-8') as f:
-            content = f.read()
-    else:
-        print(f"Downloading completely fresh {LOCAL_INDEX_PATH}...")
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(REMOTE_INDEX_URL, timeout=600.0)
-            content = resp.text
-            with open(LOCAL_INDEX_PATH, 'w', encoding='utf-8') as f:
-                f.write(content)
-
-    lines = [line for line in content.splitlines() if not line.startswith('#') and 'file,' not in line]
-
-    data = []
-
-    for line in lines:
-        parts = line.split(',')
-
-        if len(parts) >= 8:
-            try:
-                data.append({
-                    'file': parts[0],
-                    'date': parts[1],
-                    'lat': float(parts[2]),
-                    'lon': float(parts[3]),
-                    'ocean': parts[4],
-                    'profiler_type': parts[5],
-                    'institution': parts[6],
-                    'date_update': parts[7]
-                })
-            except ValueError:
-                continue
-
-    CACHED_PROFILES_CORE = data
-    DATE_SORTED_PROFILES_CORE = sorted(data, key=lambda x: x['date'])
-from datetime import datetime, timedelta
-
-@app.on_event("startup")
-async def startup_event():
-    global HTTP_CLIENT
-    HTTP_CLIENT = httpx.AsyncClient(
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
-        timeout=httpx.Timeout(120.0, connect=30.0),
-    )
-    await load_index()
-    await load_bio_index()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global HTTP_CLIENT
-    if HTTP_CLIENT:
-        await HTTP_CLIENT.aclose()
-    PROCESS_POOL.shutdown(wait=False)
-
-def binary_search_date_range(start_date, end_date, dataset='core'):
-
-    start_str = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y%m%d") + "000000"
-    end_str = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y%m%d") + "235959"
-
-    if dataset == 'bio':
-        profiles = DATE_SORTED_PROFILES_BIO
-    else:
-        profiles = DATE_SORTED_PROFILES_CORE
-
-    dates = [x['date'] for x in profiles]
-
-    left_idx = bisect.bisect_left(dates, start_str)
-    right_idx = bisect.bisect_right(dates, end_str)
-
-    return profiles[left_idx:right_idx]
 
 
 async def download_with_retry(file_path):
-    """Download a NetCDF file with retry and exponential backoff using the shared client."""
+    """Download a NetCDF file with retry, exponential backoff, and file locking."""
     url = f"https://data-argo.ifremer.fr/dac/{file_path}"
     filename = os.path.basename(file_path)
     local_path = os.path.join(DOWNLOADS_DIR, filename)
+    lock_path = local_path + ".lock"
+    tmp_path = local_path + ".tmp"
 
     if os.path.exists(local_path):
         return local_path
 
-    for attempt in range(MAX_DOWNLOAD_RETRIES):
-        try:
-            async with DOWNLOAD_SEMAPHORE:
-                resp = await HTTP_CLIENT.get(url)
-                resp.raise_for_status()
-                with open(local_path, 'wb') as f:
-                    f.write(resp.content)
-                return local_path
-        except Exception as e:
-            if attempt < MAX_DOWNLOAD_RETRIES - 1:
-                await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
-            else:
-                raise e
-    return local_path  # unreachable but satisfies linter
+    # Use a file-based lock to prevent multiple processes from downloading the same file
+    with FileLock(lock_path):
+        if os.path.exists(local_path):
+            return local_path
+
+        for attempt in range(MAX_DOWNLOAD_RETRIES):
+            try:
+                async with DOWNLOAD_SEMAPHORE:
+                    resp = await HTTP_CLIENT.get(url)
+                    resp.raise_for_status()
+                    # Atomic write using a temporary file
+                    async with aiofiles.open(tmp_path, mode='wb') as f:
+                        await f.write(resp.content)
+                    
+                    # Move temp file to final location
+                    os.replace(tmp_path, local_path)
+                    return local_path
+            except Exception as e:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                if attempt < MAX_DOWNLOAD_RETRIES - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise e
+    return local_path
 
 class ParamsObj:
     def __init__(self, d):
@@ -438,45 +502,21 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_json({"type": "log", "message": "Initializing Search..."})
         #await load_index()
         
-        # 1. Date Filter
-        candidates = binary_search_date_range(
+        # 1. DB Search (Combined Date & Geo)
+        filtered = await db_query_profiles(
             params['startDate'], 
             params['endDate'],
-            params['type'])
+            params['type'],
+            bounds)
 
-        await websocket.send_json({"type": "log", "message": f"Found {len(candidates)} profiles in date range."})
+        if len(filtered) > MAX_PROFILES_PER_REQUEST:
+            await websocket.send_json({"type": "error", "message": f"Request too large ({len(filtered)} profiles). Please narrow your date or area. Max is {MAX_PROFILES_PER_REQUEST}."})
+            return
+
+        await websocket.send_json({"type": "log", "message": f"Found {len(filtered)} profiles in DB."})
         
-        # 2. Geo Filter
-        print(f"[DEBUG] Bounds: N={bounds['north']:.4f} S={bounds['south']:.4f} E={bounds['east']:.4f} W={bounds['west']:.4f}  type={params['type']}")
-
-        def geo_filter(candidates, b):
-            return [
-                p for p in candidates
-                if b['south'] <= p['lat'] <= b['north'] and
-                   b['west'] <= p['lon'] <= b['east']
-            ]
-
-        filtered = geo_filter(candidates, bounds)
-
-        # Fallback: if longitudes were negative (map drew in wrong hemisphere),
-        # retry with absolute values so Indian Ocean (e.g. 64-68E) works when
-        # map accidentally returns negative longitudes (-68 to -64).
-        if not filtered and (bounds['east'] <= 0 or bounds['west'] <= 0):
-            abs_bounds = {
-                'north': bounds['north'],
-                'south': bounds['south'],
-                'east':  max(abs(bounds['east']), abs(bounds['west'])),
-                'west':  min(abs(bounds['east']), abs(bounds['west'])),
-            }
-            filtered = geo_filter(candidates, abs_bounds)
-            if filtered:
-                await websocket.send_json({"type": "log", "message": f"[Auto-corrected] Longitude sign fixed: W={abs_bounds['west']:.2f}\u00b0E to E={abs_bounds['east']:.2f}\u00b0E. Found {len(filtered)} profiles."})
-                print(f"[DEBUG] Abs-lon fallback found {len(filtered)} profiles")
-
-        await websocket.send_json({"type": "log", "message": f"Geographic filter reduced to {len(filtered)} profiles."})
-
         if not filtered:
-            await websocket.send_json({"type": "error", "message": "No profiles found in selected area/date range. Please check your bounding box covers the correct ocean region."})
+            await websocket.send_json({"type": "error", "message": "No profiles found in selected area/date range."})
             return
 
         selection = filtered
@@ -645,198 +685,146 @@ async def websocket_endpoint(websocket: WebSocket):
             pass
 
 @app.get("/api/active_floats")
-async def get_active_floats():
-    """Returns the latest location of all active floats within the last 30 days.
-    Scans both Core and Bio indices. Includes ocean and institution metadata."""
-    if not DATE_SORTED_PROFILES_CORE and not DATE_SORTED_PROFILES_BIO:
-        return {"error": "Index not loaded yet."}
-
-    now = datetime.utcnow()
-    thirty_days_ago = (now - timedelta(days=30)).strftime("%Y%m%d%H%M%S")
-
-    active_floats = {}
+@limiter.limit("30/minute")
+async def get_active_floats(request: Request, startDate: Optional[str] = None, endDate: Optional[str] = None):
+    """Returns the latest location of all floats, colored by active/inactive based on 90 days."""
     
-    # Scan Core index
-    for profile in reversed(DATE_SORTED_PROFILES_CORE):
-        if profile['date'] < thirty_days_ago:
-            break
-            
-        filename = os.path.basename(profile['file'])
-        platform, cycle = extract_metadata(filename)
+    if not endDate:
+        end_dt = datetime.utcnow()
+    else:
+        end_dt = datetime.strptime(endDate, "%Y-%m-%d")
         
-        if platform and platform not in active_floats:
-            is_bgc = platform in BGC_PLATFORMS
-            active_floats[platform] = {
-                'platform': platform,
-                'cycle': cycle,
-                'date': profile['date'],
-                'lat': profile['lat'],
-                'lon': profile['lon'],
-                'institution': profile.get('institution', ''),
-                'ocean': profile.get('ocean', ''),
-                'type': 'bgc' if is_bgc else 'core',
-            }
+    end_str = end_dt.strftime("%Y%m%d") + "235959"
+    
+    if not startDate:
+        start_str = "19900101000000"
+    else:
+        start_dt = datetime.strptime(startDate, "%Y-%m-%d")
+        start_str = start_dt.strftime("%Y%m%d") + "000000"
 
-    # Scan Bio index to catch BGC-only floats not in core index
-    for profile in reversed(DATE_SORTED_PROFILES_BIO):
-        if profile['date'] < thirty_days_ago:
-            break
+    ninety_days_ago = (end_dt - timedelta(days=90)).strftime("%Y%m%d%H%M%S")
 
-        filename = os.path.basename(profile['file'])
-        platform, cycle = extract_metadata(filename)
-
-        if platform and platform not in active_floats:
-            active_floats[platform] = {
-                'platform': platform,
-                'cycle': cycle,
-                'date': profile['date'],
-                'lat': profile['lat'],
-                'lon': profile['lon'],
-                'institution': profile.get('institution', ''),
-                'ocean': profile.get('ocean', ''),
-                'type': 'bgc',
-            }
-        elif platform and platform in active_floats:
-            # Mark existing core float as BGC if it also appears in bio index
-            active_floats[platform]['type'] = 'bgc'
-
-    count_core = sum(1 for f in active_floats.values() if f['type'] == 'core')
-    count_bgc = sum(1 for f in active_floats.values() if f['type'] == 'bgc')
-
-    # Build ocean and institution breakdowns
+    query = """
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY REPLACE(SUBSTR(file, INSTR(file, '/') + 1), SUBSTR(file, INSTR(file, '_')), '') ORDER BY date DESC) as rn
+            FROM profiles 
+            WHERE date BETWEEN ? AND ?
+        ) WHERE rn = 1
+    """
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, [start_str, end_str]) as cursor:
+            rows = await cursor.fetchall()
+            
+    active_floats = []
     ocean_counts = {}
     inst_counts = {}
-    for f in active_floats.values():
-        o = f.get('ocean', '')
-        i = f.get('institution', '')
+    core_count = 0
+    bgc_count = 0
+    
+    for row in rows:
+        filename = os.path.basename(row['file'])
+        platform, cycle = extract_metadata(filename)
+        is_bgc = platform in BGC_PLATFORMS
+        
+        status = 'active' if row['date'] >= ninety_days_ago else 'inactive'
+        
+        f_data = {
+            'platform': platform,
+            'cycle': cycle,
+            'date': row['date'],
+            'lat': row['lat'],
+            'lon': row['lon'],
+            'institution': row['institution'],
+            'ocean': row['ocean'],
+            'type': 'bgc' if is_bgc else 'core',
+            'status': status
+        }
+        active_floats.append(f_data)
+        
+        if is_bgc: bgc_count += 1
+        else: core_count += 1
+        
+        o = row['ocean']
+        i = row['institution']
         ocean_counts[o] = ocean_counts.get(o, 0) + 1
         inst_counts[i] = inst_counts.get(i, 0) + 1
 
-    # Map ocean codes to readable names
     ocean_labels = {'I': 'Indian', 'P': 'Pacific', 'A': 'Atlantic', '': 'Unknown'}
 
     return {
         "count": len(active_floats), 
-        "core_count": count_core,
-        "bgc_count": count_bgc,
+        "core_count": core_count,
+        "bgc_count": bgc_count,
         "ocean_counts": {ocean_labels.get(k, k): v for k, v in sorted(ocean_counts.items(), key=lambda x: -x[1])},
         "inst_counts": dict(sorted(inst_counts.items(), key=lambda x: -x[1])),
-        "floats": list(active_floats.values())
+        "floats": active_floats
     }
 
 @app.get("/api/trajectory/{platform_id}")
-async def get_trajectory(platform_id: str):
-    """
-    Returns all historical positions for a given platform (float) ID,
-    sorted by date. Scans the in-memory index — no downloads needed.
-    """
-    if not CACHED_PROFILES_CORE and not CACHED_PROFILES_BIO:
-        raise HTTPException(status_code=503, detail="Index not loaded yet.")
+@limiter.limit("20/minute")
+async def get_trajectory(platform_id: str, request: Request):
+    """Returns all historical positions for a given platform ID using SQLite."""
+    query = "SELECT date, lat, lon, file FROM profiles WHERE file LIKE ?"
+    pattern = f"%/{platform_id}_%"
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, [pattern]) as cursor:
+            rows = await cursor.fetchall()
 
-    points = {}  # key: cycle, value: best profile entry
-
-    # Helper to extract platform + cycle from a file path string
-    def get_platform_cycle(file_path):
-        filename = os.path.basename(file_path)
-        match = re.search(r'[A-Z]*([0-9]+)_([0-9]+D?)', filename)
-        if match:
-            return match.group(1), match.group(2)
-        return None, None
-
-    for profile in CACHED_PROFILES_CORE:
-        plat, cycle = get_platform_cycle(profile['file'])
-        if plat == platform_id:
-            # Keep the most recent update for each cycle
-            if cycle not in points or profile['date'] > points[cycle]['date']:
-                points[cycle] = {
-                    'cycle': cycle,
-                    'date': profile['date'],
-                    'lat': profile['lat'],
-                    'lon': profile['lon'],
-                }
-
-    for profile in CACHED_PROFILES_BIO:
-        plat, cycle = get_platform_cycle(profile['file'])
-        if plat == platform_id:
-            if cycle not in points or profile['date'] > points[cycle]['date']:
-                points[cycle] = {
-                    'cycle': cycle,
-                    'date': profile['date'],
-                    'lat': profile['lat'],
-                    'lon': profile['lon'],
-                }
-
-    if not points:
+    if not rows:
         raise HTTPException(status_code=404, detail=f"No trajectory data found for platform {platform_id}")
 
-    # Sort by date ascending
-    sorted_points = sorted(points.values(), key=lambda x: x['date'])
+    points = []
+    for r in rows:
+        _, cycle = extract_metadata(os.path.basename(r['file']))
+        points.append({
+            'cycle': cycle,
+            'date': r['date'],
+            'lat': r['lat'],
+            'lon': r['lon']
+        })
+
+    points.sort(key=lambda x: x['date'])
 
     return {
         "platform_id": platform_id,
-        "total_cycles": len(sorted_points),
-        "first_date": sorted_points[0]['date'],
-        "last_date": sorted_points[-1]['date'],
-        "points": sorted_points
+        "total_cycles": len(points),
+        "first_date": points[0]['date'],
+        "last_date": points[-1]['date'],
+        "points": points
     }
 
 
 # ── Shared Search & Extract Helper ─────────────────────────────────────────────
 async def search_and_extract(bounds_dict, params_dict):
     """
-    Shared helper: performs date filter → geo filter → download → extract.
-    Returns (all_results, stats_dict) where all_results is a list of row dicts.
+    Shared helper: performs SQLite search → download → parallel extraction.
+    Caches results in diskcache.
     """
+    # Create cache key from sorted params
+    cache_key = hashlib.md5(json.dumps({**bounds_dict, **params_dict}, sort_keys=True).encode()).hexdigest()
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        return cached_data['results'], cached_data['stats']
+
     params_obj = ParamsObj({
         'minDepth': float(params_dict.get('minDepth', 0)),
         'maxDepth': float(params_dict.get('maxDepth', 2000)),
     })
 
-    def safe_float(val, default):
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return default
-
-    raw_north = safe_float(bounds_dict.get('north'), 90.0)
-    raw_south = safe_float(bounds_dict.get('south'), -90.0)
-    raw_east  = safe_float(bounds_dict.get('east'),  180.0)
-    raw_west  = safe_float(bounds_dict.get('west'),  -180.0)
-
-    norm_bounds = {
-        'north': max(raw_north, raw_south),
-        'south': min(raw_north, raw_south),
-        'east':  max(raw_east, raw_west),
-        'west':  min(raw_east, raw_west),
-    }
-
-    # Date filter
-    candidates = binary_search_date_range(
+    # 1. DB Search
+    filtered = await db_query_profiles(
         params_dict['startDate'],
         params_dict['endDate'],
-        params_dict.get('type', 'core')
+        params_dict.get('type', 'core'),
+        bounds_dict
     )
 
-    # Geo filter
-    filtered = [
-        p for p in candidates
-        if norm_bounds['south'] <= p['lat'] <= norm_bounds['north'] and
-           norm_bounds['west'] <= p['lon'] <= norm_bounds['east']
-    ]
-
-    # Abs-lon fallback
-    if not filtered and (norm_bounds['east'] <= 0 or norm_bounds['west'] <= 0):
-        abs_bounds = {
-            'north': norm_bounds['north'],
-            'south': norm_bounds['south'],
-            'east':  max(abs(norm_bounds['east']), abs(norm_bounds['west'])),
-            'west':  min(abs(norm_bounds['east']), abs(norm_bounds['west'])),
-        }
-        filtered = [
-            p for p in candidates
-            if abs_bounds['south'] <= p['lat'] <= abs_bounds['north'] and
-               abs_bounds['west'] <= p['lon'] <= abs_bounds['east']
-        ]
+    if len(filtered) > MAX_PROFILES_PER_REQUEST:
+        raise HTTPException(status_code=413, detail=f"Request too large ({len(filtered)} profiles). Max {MAX_PROFILES_PER_REQUEST}.")
 
     if not filtered:
         return [], {'total': 0, 'extracted': 0, 'errors': 0}
@@ -846,6 +834,7 @@ async def search_and_extract(bounds_dict, params_dict):
     error_count = 0
     extracted_count = 0
 
+    # Batching for downloads
     for chunk_start in range(0, len(filtered), BATCH_CHUNK_SIZE):
         chunk = filtered[chunk_start:chunk_start + BATCH_CHUNK_SIZE]
 
@@ -858,37 +847,49 @@ async def search_and_extract(bounds_dict, params_dict):
 
         download_results = await asyncio.gather(*[download_one(p) for p in chunk])
 
-        for profile, result in download_results:
-            if isinstance(result, Exception):
-                error_count += 1
-                continue
+        # Concurrent Extraction with Semaphore limit
+        async def extract_one(profile, local_path):
+            nonlocal extracted_count, error_count
             try:
-                extracted = await loop.run_in_executor(
-                    PROCESS_POOL, process_netcdf, result, params_obj
-                )
-                filename = os.path.basename(profile['file'])
-                platform, cycle = extract_metadata(filename)
-                for row in extracted:
-                    row.update({
-                        'Date': profile['date'],
-                        'Latitude': profile['lat'],
-                        'Longitude': profile['lon'],
-                        'Platform': platform,
-                        'Cycle': cycle,
-                        'Institution': profile.get('institution', ''),
-                        'Ocean': profile.get('ocean', ''),
-                        'File': filename
-                    })
-                    all_results.append(row)
-                extracted_count += 1
+                async with EXTRACTION_SEMAPHORE:
+                    extracted = await loop.run_in_executor(
+                        PROCESS_POOL, process_netcdf, local_path, params_obj
+                    )
+                    filename = os.path.basename(profile['file'])
+                    platform, cycle = extract_metadata(filename)
+                    for row in extracted:
+                        row.update({
+                            'Date': profile['date'],
+                            'Latitude': profile['lat'],
+                            'Longitude': profile['lon'],
+                            'Platform': platform,
+                            'Cycle': cycle,
+                            'Institution': profile.get('institution', ''),
+                            'Ocean': profile.get('ocean', ''),
+                            'File': filename
+                        })
+                        all_results.append(row)
+                    extracted_count += 1
             except Exception:
                 error_count += 1
 
-    return all_results, {
+        await asyncio.gather(*[extract_one(p, r) for p, r in download_results if not isinstance(r, Exception)])
+        
+        # Count download errors
+        for _, r in download_results:
+            if isinstance(r, Exception):
+                error_count += 1
+
+    stats = {
         'total': len(filtered),
         'extracted': extracted_count,
         'errors': error_count
     }
+    
+    # Cache for 24 hours
+    cache.set(cache_key, {'results': all_results, 'stats': stats}, expire=86400)
+
+    return all_results, stats
 
 
 # ── Multi-Format Export Endpoints ──────────────────────────────────────────────
@@ -1003,16 +1004,77 @@ async def export_netcdf(req: ExportRequest):
         'conventions': 'CF-1.8',
     }
 
-    # Write to bytes buffer
-    nc_buffer = io.BytesIO()
-    ds.to_netcdf(nc_buffer, engine='scipy')
-    nc_bytes = nc_buffer.getvalue()
+    # Write to temp file (scipy engine closes BytesIO buffers)
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as tmp:
+        tmp_path = tmp.name
+    ds.to_netcdf(tmp_path, engine='scipy')
+    with open(tmp_path, 'rb') as f:
+        nc_bytes = f.read()
+    os.remove(tmp_path)
 
     return Response(
         content=nc_bytes,
         media_type='application/x-netcdf',
         headers={
             'Content-Disposition': f'attachment; filename="argo_export_{stats["total"]}_profiles.nc"'
+        }
+    )
+
+
+# ── DIVA Gridded Export Endpoint ───────────────────────────────────────────────
+
+@app.post("/api/export/diva")
+async def export_diva_gridded(req: DivaExportRequest):
+    """
+    Export DIVA-style gridded product as a NetCDF file.
+    Runs Optimal Interpolation on the selected Argo profiles and returns
+    a CF-compliant NetCDF with the analysis field and DIVA error field.
+    """
+    bounds_dict = req.bounds.dict()
+    params_dict = req.params.dict()
+
+    all_results, stats = await search_and_extract(bounds_dict, params_dict)
+    if not all_results:
+        raise HTTPException(status_code=404, detail="No data found for DIVA gridding.")
+
+    # Run the gridding in the process pool (CPU-intensive)
+    loop = asyncio.get_event_loop()
+    gridded_ds = await loop.run_in_executor(
+        PROCESS_POOL,
+        grid_argo_data,
+        all_results,
+        req.variable,
+        bounds_dict,
+        req.depth_level,
+        req.depth_tolerance,
+        req.resolution,
+        req.method,
+        req.corr_length,
+        req.snr
+    )
+
+    if gridded_ds is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Insufficient data for DIVA gridding variable '{req.variable}' at depth {req.depth_level}m. Need at least 3 observations."
+        )
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as tmp:
+        tmp_path = tmp.name
+    gridded_ds.to_netcdf(tmp_path, engine='scipy')
+    with open(tmp_path, 'rb') as f:
+        nc_bytes = f.read()
+    os.remove(tmp_path)
+
+    filename = f"argo_diva_{req.variable}_{req.depth_level}m_{req.resolution}deg_{req.method}.nc"
+
+    return Response(
+        content=nc_bytes,
+        media_type='application/x-netcdf',
+        headers={
+            'Content-Disposition': f'attachment; filename="{filename}"'
         }
     )
 
@@ -1116,9 +1178,13 @@ async def download_grid_netcdf(req: GridRequest):
     if gridded_ds is None:
         raise HTTPException(status_code=422, detail="Insufficient data for gridding.")
 
-    nc_buffer = io.BytesIO()
-    gridded_ds.to_netcdf(nc_buffer, engine='scipy')
-    nc_bytes = nc_buffer.getvalue()
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as tmp:
+        tmp_path = tmp.name
+    gridded_ds.to_netcdf(tmp_path, engine='scipy')
+    with open(tmp_path, 'rb') as f:
+        nc_bytes = f.read()
+    os.remove(tmp_path)
 
     return Response(
         content=nc_bytes,
