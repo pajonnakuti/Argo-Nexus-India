@@ -1009,12 +1009,11 @@ async def admin_resync():
 @limiter.limit("20/minute")
 async def get_trajectory(platform_id: str, request: Request):
     """Returns all historical positions for a given platform ID using SQLite."""
-    query = "SELECT date, lat, lon, file FROM profiles WHERE file LIKE ? AND lat BETWEEN -90 AND 90 AND lon BETWEEN -180 AND 180"
-    pattern = f"%/{platform_id}/profiles/%"
+    query = "SELECT date, lat, lon, file FROM profiles WHERE platform = ? AND lat BETWEEN -90 AND 90 AND lon BETWEEN -180 AND 180"
     
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(query, [pattern]) as cursor:
+        async with db.execute(query, [platform_id]) as cursor:
             rows = await cursor.fetchall()
 
     if not rows:
