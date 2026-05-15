@@ -65,7 +65,7 @@ const ActiveFloatsControl = ({ showActive, setShowActive, showInactive, setShowI
           <div className="filter-divider"></div>
           <div className="filter-section-label">Status</div>
           <div className={`filter-option ${showInactive ? 'selected' : ''}`} onClick={() => setShowInactive(!showInactive)}>
-            {showInactive ? 'Hide' : 'Show'} Inactive Floats (&gt;90 days)
+            {showInactive ? 'Hide' : 'Show'} Inactive Floats (&gt;45 days)
           </div>
           
           <div className="filter-divider"></div>

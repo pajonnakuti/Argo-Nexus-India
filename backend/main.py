@@ -834,10 +834,10 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
         
     end_str = end_dt.strftime("%Y%m%d") + "235959"
     
-    # ALWAYS look back 90 days from endDate for active float display
-    # This is the key fix: startDate does NOT restrict the map view
-    ninety_days_ago_dt = end_dt - timedelta(days=90)
-    start_str = ninety_days_ago_dt.strftime("%Y%m%d") + "000000"
+    # ALWAYS look back 45 days from endDate for active float display
+    # This aligns with the official Argo Information Centre's definition of an operational float
+    active_window_dt = end_dt - timedelta(days=45)
+    start_str = active_window_dt.strftime("%Y%m%d") + "000000"
 
     # Single DB connection for entire computation
     async with aiosqlite.connect(DB_PATH) as db:
