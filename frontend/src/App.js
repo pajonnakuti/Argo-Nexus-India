@@ -93,26 +93,62 @@ function App() {
         };
       }
 
-      const response = await fetch(url, {
+      // Step 1: Submit job (returns instantly)
+      const submitResp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
 
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.detail || `Export failed with status ${response.status}`);
+      if (!submitResp.ok) {
+        const err = await submitResp.json();
+        throw new Error(err.detail || `Export failed with status ${submitResp.status}`);
+      }
+
+      const { job_id } = await submitResp.json();
+      setLogs(prev => [...prev, `📋 Export job submitted (${job_id.slice(0,8)}...)`]);
+
+      // Step 2: Poll for progress
+      let status = 'queued';
+      while (status !== 'done' && status !== 'error') {
+        await new Promise(r => setTimeout(r, 2000)); // Poll every 2s
+        const pollResp = await fetch(`http://localhost:8000/api/export/status/${job_id}`);
+        const pollData = await pollResp.json();
+        status = pollData.status;
+
+        if (status === 'running') {
+          const pct = pollData.total > 0 ? Math.round((pollData.progress / pollData.total) * 100) : 0;
+          setLogs(prev => {
+            const filtered = prev.filter(l => !l.startsWith('⏳'));
+            return [...filtered, `⏳ Processing: ${pollData.progress}/${pollData.total} profiles (${pct}%)`];
+          });
+        } else if (status === 'formatting') {
+          setLogs(prev => {
+            const filtered = prev.filter(l => !l.startsWith('⏳'));
+            return [...filtered, `⏳ Formatting ${fmt.toUpperCase()} output...`];
+          });
+        } else if (status === 'error') {
+          throw new Error(pollData.error || 'Export failed');
+        }
+      }
+
+      // Step 3: Download the file
+      setLogs(prev => [...prev, `⬇️ Downloading file...`]);
+      const downloadResp = await fetch(`http://localhost:8000/api/export/download/${job_id}`);
+      if (!downloadResp.ok) {
+        const err = await downloadResp.json();
+        throw new Error(err.detail || 'Download failed');
       }
 
       // Determine filename from Content-Disposition header
-      const disposition = response.headers.get('Content-Disposition');
+      const disposition = downloadResp.headers.get('Content-Disposition');
       let filename = fmt === 'diva' ? `argo_diva_${gridConfig.variable}.nc` : `argo_export.${fmt}`;
       if (disposition) {
         const match = disposition.match(/filename="?([^"]+)"?/);
         if (match) filename = match[1];
       }
 
-      const blob = await response.blob();
+      const blob = await downloadResp.blob();
       const blobUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = blobUrl;

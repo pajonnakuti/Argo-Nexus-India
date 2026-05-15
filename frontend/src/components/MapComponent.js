@@ -4,7 +4,7 @@ import { EditControl } from 'react-leaflet-draw';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import 'leaflet-draw/dist/leaflet.draw.css';
-import CesiumView from './CesiumView';
+import GlobeView from './GlobeView';
 
 import icon from 'leaflet/dist/images/marker-icon.png';
 import iconShadow from 'leaflet/dist/images/marker-shadow.png';
@@ -26,145 +26,91 @@ const INST_LABELS = {
 };
 
 const ActiveFloatsControl = ({ showActive, setShowActive, showInactive, setShowInactive, floatFilter, setFloatFilter, oceanFilter, setOceanFilter, instFilter, setInstFilter, floatCounts, parameterCounts }) => {
-  const map = useMap();
+  // Active filter count badge
+  let activeFilterCount = 0;
+  if (floatFilter !== 'all') activeFilterCount++;
+  if (oceanFilter !== 'all') activeFilterCount++;
+  if (instFilter !== 'all') activeFilterCount++;
 
-  useEffect(() => {
-    const CustomControl = L.Control.extend({
-      options: { position: 'topright' },
-      onAdd: function () {
-        const container = L.DomUtil.create('div', 'leaflet-bar leaflet-control custom-control active-floats-control-wrapper');
+  const instEntries = Object.entries(floatCounts.inst || {});
+  instEntries.sort((a, b) => b[1] - a[1]);
 
-        // Build institution options HTML
-        const instEntries = Object.entries(floatCounts.inst || {});
-        const instOptionsHtml = instEntries.map(([code, count]) => 
-          `<div class="filter-option ${instFilter === code ? 'selected' : ''}" data-inst="${code}">
-            ${INST_LABELS[code] || code} (${count})
-          </div>`
-        ).join('');
+  const oceanEntries = Object.entries(floatCounts.ocean || {});
+  oceanEntries.sort((a, b) => b[1] - a[1]);
 
-        // Build ocean options HTML
-        const oceanEntries = Object.entries(floatCounts.ocean || {});
-        const oceanOptionsHtml = oceanEntries.map(([name, count]) => 
-          `<div class="filter-option ${oceanFilter === name ? 'selected' : ''}" data-ocean="${name}">
-            ${name} (${count})
-          </div>`
-        ).join('');
+  return (
+    <div className="leaflet-bar leaflet-control custom-control active-floats-control-wrapper" style={{ position: 'absolute', top: 10, right: 10, zIndex: 1000, margin: 0 }}>
+      <div className="active-floats-dropdown">
+        <button 
+          className={`active-floats-btn ${showActive ? 'active' : ''}`} 
+          title="Toggle Floats"
+          onClick={() => setShowActive(!showActive)}
+        >
+          📡 {showActive ? 'Hide' : 'Show'} Floats {floatCounts.total > 0 ? `(${showInactive ? floatCounts.total : floatCounts.active})` : ''} 
+          {activeFilterCount > 0 && <span className="filter-badge">{activeFilterCount}</span>}
+          <span className="dropdown-arrow">▼</span>
+        </button>
+        <div className={`dropdown-content ${showActive ? 'show' : ''}`}>
+          <div className="filter-section-label">Type</div>
+          <div className={`filter-option ${floatFilter === 'all' ? 'selected' : ''}`} onClick={() => { if (!showActive) setShowActive(true); setFloatFilter('all'); }}>
+            All ({floatCounts.total})
+          </div>
+          <div className={`filter-option ${floatFilter === 'core' ? 'selected' : ''}`} onClick={() => { if (!showActive) setShowActive(true); setFloatFilter('core'); }}>
+            Core ({floatCounts.core})
+          </div>
+          <div className={`filter-option ${floatFilter === 'bgc' ? 'selected' : ''}`} onClick={() => { if (!showActive) setShowActive(true); setFloatFilter('bgc'); }}>
+            BGC ({floatCounts.bgc})
+          </div>
+          
+          <div className="filter-divider"></div>
+          <div className="filter-section-label">Status</div>
+          <div className={`filter-option ${showInactive ? 'selected' : ''}`} onClick={() => setShowInactive(!showInactive)}>
+            {showInactive ? 'Hide' : 'Show'} Inactive Floats (&gt;90 days)
+          </div>
+          
+          <div className="filter-divider"></div>
+          <div className="filter-section-label">Ocean</div>
+          <div className={`filter-option ${oceanFilter === 'all' ? 'selected' : ''}`} onClick={() => { if (!showActive) setShowActive(true); setOceanFilter('all'); }}>
+            All Oceans
+          </div>
+          {oceanEntries.map(([name, count]) => (
+            <div key={name} className={`filter-option ${oceanFilter === name ? 'selected' : ''}`} onClick={() => { if (!showActive) setShowActive(true); setOceanFilter(name); }}>
+              {name} ({count})
+            </div>
+          ))}
 
-        // Active filter count badge
-        let activeFilterCount = 0;
-        if (floatFilter !== 'all') activeFilterCount++;
-        if (oceanFilter !== 'all') activeFilterCount++;
-        if (instFilter !== 'all') activeFilterCount++;
-        const badge = activeFilterCount > 0 ? `<span class="filter-badge">${activeFilterCount}</span>` : '';
+          <div className="filter-divider"></div>
+          <div className="filter-section-label">Institution</div>
+          <div className={`filter-option ${instFilter === 'all' ? 'selected' : ''}`} onClick={() => { if (!showActive) setShowActive(true); setInstFilter('all'); }}>
+            All Institutions
+          </div>
+          {instEntries.map(([code, count]) => (
+            <div key={code} className={`filter-option ${instFilter === code ? 'selected' : ''}`} onClick={() => { if (!showActive) setShowActive(true); setInstFilter(code); }}>
+              {INST_LABELS[code] || code} ({count})
+            </div>
+          ))}
 
-        container.innerHTML = `
-          <div class="active-floats-dropdown">
-            <button class="active-floats-btn ${showActive ? 'active' : ''}" title="Toggle Floats">
-              📡 ${showActive ? 'Hide' : 'Show'} Floats ${floatCounts.total > 0 ? `(${showInactive ? floatCounts.total : floatCounts.active})` : ''} ${badge}
-              <span class="dropdown-arrow">▼</span>
-            </button>
-            <div class="dropdown-content ${showActive ? 'show' : ''}">
-              <div class="filter-section-label">Type</div>
-              <div class="filter-option ${floatFilter === 'all' ? 'selected' : ''}" data-filter="all">
-                All (${floatCounts.total})
-              </div>
-              <div class="filter-option ${floatFilter === 'core' ? 'selected' : ''}" data-filter="core">
-                Core (${floatCounts.core})
-              </div>
-              <div class="filter-option ${floatFilter === 'bgc' ? 'selected' : ''}" data-filter="bgc">
-                BGC (${floatCounts.bgc})
-              </div>
-              <div class="filter-divider"></div>
-              <div class="filter-section-label">Status</div>
-              <div class="filter-option ${showInactive ? 'selected' : ''}" id="toggle-inactive">
-                ${showInactive ? 'Hide' : 'Show'} Inactive Floats (>90 days)
-              </div>
-              <div class="filter-divider"></div>
-              <div class="filter-section-label">Ocean</div>
-              <div class="filter-option ${oceanFilter === 'all' ? 'selected' : ''}" data-ocean="all">
-                All Oceans
-              </div>
-              ${oceanOptionsHtml}
-              <div class="filter-divider"></div>
-              <div class="filter-section-label">Institution</div>
-              <div class="filter-option ${instFilter === 'all' ? 'selected' : ''}" data-inst="all">
-                All Institutions
-              </div>
-              ${instOptionsHtml}
-              <div class="filter-divider"></div>
-              <div style="font-size: 0.75rem; text-align: center;">
-                <div><strong>Total Global Floats:</strong> ${floatCounts.total}</div>
-                <div><strong>Total INCOIS Floats:</strong> ${floatCounts.incoisTotal} (${floatCounts.incoisVisible} in view)</div>
-                <div><strong>Core:</strong> ${floatCounts.core} | <strong>BGC:</strong> ${floatCounts.bgc}</div>
-              </div>
-              <div class="parameter-coverage">
-                <div class="filter-section-label" style="text-align: center; margin-bottom: 6px;">PARAMETER COVERAGE</div>
-                <div style="text-align: center; margin-bottom: 4px;"><strong>NO<sub>3</sub>:</strong> ${parameterCounts.NO3} <span style="color: #cbd5e1; margin: 0 4px;">|</span> <strong>DOXY:</strong> ${parameterCounts.DOXY}</div>
-                <div style="text-align: center;"><strong>CHLA:</strong> ${parameterCounts.CHLA} <span style="color: #cbd5e1; margin: 0 4px;">|</span> <strong>BBP700:</strong> ${parameterCounts.BBP700}</div>
-              </div>
+          <div className="filter-divider"></div>
+          <div style={{ fontSize: '0.75rem', textAlign: 'center' }}>
+            <div><strong>Total Global Floats:</strong> {floatCounts.total}</div>
+            <div><strong>Total INCOIS Floats:</strong> {floatCounts.incoisTotal} </div>
+            <div style={{ color: '#0ea5e9' }}>({floatCounts.incoisVisible} in view: {floatCounts.incoisCoreVisible} Core | {floatCounts.incoisBgcVisible} BGC)</div>
+            <div style={{ marginTop: 4 }}><strong>Global Core:</strong> {floatCounts.core} | <strong>Global BGC:</strong> {floatCounts.bgc}</div>
+          </div>
+          
+          <div className="parameter-coverage">
+            <div className="filter-section-label" style={{ textAlign: 'center', marginBottom: '6px' }}>PARAMETER COVERAGE</div>
+            <div style={{ textAlign: 'center', marginBottom: '4px' }}>
+              <strong>NO<sub>3</sub>:</strong> {parameterCounts.NO3} <span style={{ color: '#cbd5e1', margin: '0 4px' }}>|</span> <strong>DOXY:</strong> {parameterCounts.DOXY}
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <strong>CHLA:</strong> {parameterCounts.CHLA} <span style={{ color: '#cbd5e1', margin: '0 4px' }}>|</span> <strong>BBP700:</strong> {parameterCounts.BBP700}
             </div>
           </div>
-        `;
-
-        const btn = container.querySelector('.active-floats-btn');
-        btn.onclick = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          setShowActive(!showActive);
-        };
-
-        // Type filter clicks
-        container.querySelectorAll('[data-filter]').forEach(opt => {
-          opt.onclick = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (!showActive) setShowActive(true);
-            setFloatFilter(opt.getAttribute('data-filter'));
-          };
-        });
-
-        // Ocean filter clicks
-        container.querySelectorAll('[data-ocean]').forEach(opt => {
-          opt.onclick = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (!showActive) setShowActive(true);
-            setOceanFilter(opt.getAttribute('data-ocean'));
-          };
-        });
-
-        // Institution filter clicks
-        container.querySelectorAll('[data-inst]').forEach(opt => {
-          opt.onclick = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (!showActive) setShowActive(true);
-            setInstFilter(opt.getAttribute('data-inst'));
-          };
-        });
-
-        // Inactive floats toggle
-        const toggleInactive = container.querySelector('#toggle-inactive');
-        if (toggleInactive) {
-          toggleInactive.onclick = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            setShowInactive(!showInactive);
-          };
-        }
-
-        L.DomEvent.disableClickPropagation(container);
-        L.DomEvent.disableScrollPropagation(container);
-        return container;
-      }
-    });
-
-    const control = new CustomControl();
-    map.addControl(control);
-    return () => map.removeControl(control);
-  }, [map, showActive, setShowActive, showInactive, setShowInactive, floatFilter, setFloatFilter, oceanFilter, setOceanFilter, instFilter, setInstFilter, floatCounts]);
-
-  return null;
+        </div>
+      </div>
+    </div>
+  );
 };
 
 // ── Trajectory Info Panel ─────────────────────────────────────────────────────
@@ -232,7 +178,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
 
   const [is3D, setIs3D] = useState(false);
   const [activeFloats, setActiveFloats] = useState([]);
-  const [showActive, setShowActive] = useState(false);
+  const [showActive, setShowActive] = useState(true);
   const [showInactive, setShowInactive] = useState(false);
   const [floatFilter, setFloatFilter] = useState('all');
   const [oceanFilter, setOceanFilter] = useState('all');
@@ -275,6 +221,8 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
             inst: data.inst_counts || {},
             incoisTotal: data.incois_total || 0,
             incoisVisible: data.incois_visible || 0,
+            incoisCoreVisible: data.incois_core_visible || 0,
+            incoisBgcVisible: data.incois_bgc_visible || 0,
             bgcParams: data.bgc_parameter_counts || { NO3: 0, DOXY: 0, CHLA: 0, BBP700: 0 }
           };
           setActiveFloats(data.floats || []);
@@ -283,6 +231,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
       })
       .catch(err => console.error("Failed to load active floats:", err))
       .finally(() => setIsMapLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [startDate, endDate]); // Re-fetch when sidebar dates change
 
   // Sync bounding-box rectangle
@@ -380,6 +329,22 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
           </button>
       </div>
 
+      {/* Floating UI Overlay for Floats Filter Panel */}
+      <ActiveFloatsControl 
+        showActive={showActive} 
+        setShowActive={setShowActive}
+        showInactive={showInactive}
+        setShowInactive={setShowInactive}
+        floatFilter={floatFilter}
+        setFloatFilter={setFloatFilter}
+        oceanFilter={oceanFilter}
+        setOceanFilter={setOceanFilter}
+        instFilter={instFilter}
+        setInstFilter={setInstFilter}
+        floatCounts={floatCounts}
+        parameterCounts={parameterCounts}
+      />
+
       {/* Trajectory panel — rendered outside MapContainer so it's above it */}
       <TrajectoryPanel
         float={selectedFloat}
@@ -389,10 +354,13 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
       />
 
       {is3D ? (
-          <CesiumView 
+          <GlobeView 
              activeFloats={activeFloats}
              showActive={showActive}
+             showInactive={showInactive}
              floatFilter={floatFilter}
+             oceanFilter={oceanFilter}
+             instFilter={instFilter}
              selectedFloat={selectedFloat}
              trajectoryPoints={trajectoryPoints}
              onFloatClick={handleFloatClick}

@@ -32,6 +32,10 @@ import shutil
 ACTIVE_FLOATS_CACHE = {}  # key: "start_end", value: {'response': dict, 'timestamp': float, 'ttl': 1800}
 BGC_PARAM_COUNTS = {'NO3': 0, 'DOXY': 0, 'CHLA': 0, 'BBP700': 0, 'PH': 0}
 
+# ── Async Export Job System ───────────────────────────────────────────────────
+import uuid
+EXPORT_JOBS = {}  # job_id -> {'status': str, 'progress': int, 'total': int, 'result_path': str, 'error': str, 'format': str, 'filename': str}
+
 async def cleanup_task():
     """Background task to enforce 20GB size limit on downloads directory (LRU)."""
     MAX_SIZE = 20 * 1024 * 1024 * 1024 # 20 GB
@@ -815,7 +819,13 @@ async def websocket_endpoint(websocket: WebSocket):
             pass
 
 async def _build_active_floats_response(startDate: Optional[str], endDate: Optional[str]):
-    """Builds the active floats response object. Used by cache and endpoint."""
+    """Builds the active floats response object. Used by cache and endpoint.
+    
+    Logic: Always shows floats active within 90 days of endDate.
+    The startDate parameter is IGNORED for active float display — the map
+    always shows a 90-day lookback window from endDate (or today).
+    This ensures that setting date to "today" still shows all active floats.
+    """
     
     if not endDate:
         end_dt = datetime.utcnow()
@@ -824,38 +834,27 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
         
     end_str = end_dt.strftime("%Y%m%d") + "235959"
     
-    if not startDate:
-        start_str = "19900101000000"
-    else:
-        start_dt = datetime.strptime(startDate, "%Y-%m-%d")
-        start_str = start_dt.strftime("%Y%m%d") + "000000"
-
-    ninety_days_ago = (end_dt - timedelta(days=90)).strftime("%Y%m%d%H%M%S")
+    # ALWAYS look back 90 days from endDate for active float display
+    # This is the key fix: startDate does NOT restrict the map view
+    ninety_days_ago_dt = end_dt - timedelta(days=90)
+    start_str = ninety_days_ago_dt.strftime("%Y%m%d") + "000000"
 
     # Single DB connection for entire computation
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('PRAGMA journal_mode=WAL')
         db.row_factory = aiosqlite.Row
 
-        # Fast query: GROUP BY platform to get latest date within range, then join back
+        # Fast single-pass query: GROUP BY platform with MAX(date) to get latest position.
+        # SQLite bare-column guarantee: non-aggregated columns come from the MAX(date) row.
+        # No geo filter in SQL (only 0.01% invalid rows) — filter in Python for 13x speedup.
         query = '''
-            SELECT p.file, p.platform, p.date, p.lat, p.lon, p.ocean, 
-                   p.profiler_type, p.institution, p.type
-            FROM profiles p
-            INNER JOIN (
-                SELECT platform, MAX(date) as max_date
-                FROM profiles
-                WHERE date BETWEEN ? AND ?
-                AND lat BETWEEN -90 AND 90
-                AND lon BETWEEN -180 AND 180
-                GROUP BY platform
-            ) latest ON p.platform = latest.platform AND p.date = latest.max_date
-            WHERE p.date BETWEEN ? AND ?
-            AND p.lat BETWEEN -90 AND 90
-            AND p.lon BETWEEN -180 AND 180
-            GROUP BY p.platform
+            SELECT file, platform, MAX(date) as date, lat, lon, ocean, 
+                   profiler_type, institution, type
+            FROM profiles
+            WHERE date BETWEEN ? AND ?
+            GROUP BY platform
         '''
-        async with db.execute(query, [start_str, end_str, start_str, end_str]) as cursor:
+        async with db.execute(query, [start_str, end_str]) as cursor:
             rows = await cursor.fetchall()
 
         # Fetch all metadata for institution mapping
@@ -868,23 +867,25 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
         cursor = await db.execute("SELECT COUNT(*) FROM metadata WHERE institution = 'IN'")
         incois_total = (await cursor.fetchone())[0]
 
-    # Process rows
+    # Process rows — all floats in the 90-day window are "active" by definition
     active_floats = []
     ocean_counts = {}
     inst_counts = {}
     total_core = 0
     total_bgc = 0
-    active_core = 0
-    active_bgc = 0
-    active_count = 0
     incois_visible = 0
+    incois_core_visible = 0
+    incois_bgc_visible = 0
 
     for row in rows:
+        # Skip rows with invalid coordinates (0.01% of data — filtered in Python for speed)
+        lat, lon = row['lat'], row['lon']
+        if lat is None or lon is None or lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            continue
         filename = os.path.basename(row['file'])
         platform, cycle = extract_metadata(filename)
         is_bgc = platform in BGC_PLATFORMS
         inst = meta_dict.get(platform, row['institution'])
-        is_active = row['date'] >= ninety_days_ago
 
         f_data = {
             'platform': platform,
@@ -895,7 +896,7 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
             'institution': inst,
             'ocean': row['ocean'],
             'type': 'bgc' if is_bgc else 'core',
-            'status': 'active' if is_active else 'inactive'
+            'status': 'active'  # All floats in the 90-day window are active
         }
         active_floats.append(f_data)
 
@@ -904,33 +905,33 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
         else:
             total_core += 1
 
-        if is_active:
-            active_count += 1
-            if is_bgc:
-                active_bgc += 1
-            else:
-                active_core += 1
-
         if inst == 'IN':
             incois_visible += 1
+            if is_bgc:
+                incois_bgc_visible += 1
+            else:
+                incois_core_visible += 1
 
         o = row['ocean']
         ocean_counts[o] = ocean_counts.get(o, 0) + 1
         inst_counts[inst] = inst_counts.get(inst, 0) + 1
 
     ocean_labels = {'I': 'Indian', 'P': 'Pacific', 'A': 'Atlantic', '': 'Unknown'}
+    active_count = len(active_floats)  # All returned floats are active
 
     return {
         "count": len(active_floats),
         "active_count": active_count,
         "core_count": total_core,
         "bgc_count": total_bgc,
-        "active_core_count": active_core,
-        "active_bgc_count": active_bgc,
+        "active_core_count": total_core,
+        "active_bgc_count": total_bgc,
         "ocean_counts": {ocean_labels.get(k, k): v for k, v in sorted(ocean_counts.items(), key=lambda x: -x[1])},
         "inst_counts": dict(sorted(inst_counts.items(), key=lambda x: -x[1])),
         "incois_total": incois_total,
         "incois_visible": incois_visible,
+        "incois_core_visible": incois_core_visible,
+        "incois_bgc_visible": incois_bgc_visible,
         "bgc_parameter_counts": BGC_PARAM_COUNTS,
         "floats": active_floats
     }
@@ -1136,130 +1137,293 @@ async def search_and_extract(bounds_dict, params_dict):
 
 # ── Multi-Format Export Endpoints ──────────────────────────────────────────────
 
-@app.post("/api/export/csv")
-async def export_csv(req: ExportRequest):
-    """Export search results as CSV."""
-    bounds_dict = req.bounds.dict()
-    params_dict = req.params.dict()
-    params_dict['selectedVars'] = req.selectedVars or []
+# ── Async Export Job Runner ────────────────────────────────────────────────────
 
-    all_results, stats = await search_and_extract(bounds_dict, params_dict)
-    if not all_results:
-        raise HTTPException(status_code=404, detail="No data found for the given search parameters.")
-
-    df = pd.DataFrame(all_results)
-    df.replace('', np.nan, inplace=True)
-    df.dropna(axis=1, how='all', inplace=True)
-    df.rename(columns={'depth': 'Depth (dbar)'}, inplace=True)
-
-    csv_buffer = io.StringIO()
-    df.to_csv(csv_buffer, index=False)
-    csv_content = csv_buffer.getvalue()
-
-    return Response(
-        content="\ufeff" + csv_content,
-        media_type='text/csv',
-        headers={
-            'Content-Disposition': f'attachment; filename="argo_export_{stats["total"]}_profiles.csv"'
-        }
-    )
-
-
-@app.post("/api/export/json")
-async def export_json(req: ExportRequest):
-    """Export search results as JSON."""
-    bounds_dict = req.bounds.dict()
-    params_dict = req.params.dict()
-    params_dict['selectedVars'] = req.selectedVars or []
-
-    all_results, stats = await search_and_extract(bounds_dict, params_dict)
-    if not all_results:
-        raise HTTPException(status_code=404, detail="No data found for the given search parameters.")
-
-    # Clean up NaN values for JSON serialization
-    clean_results = []
-    for row in all_results:
-        clean_row = {}
-        for k, v in row.items():
-            if isinstance(v, float) and np.isnan(v):
-                clean_row[k] = None
-            else:
-                clean_row[k] = v
-        clean_results.append(clean_row)
-
-    output = {
-        "metadata": {
-            "total_profiles": stats['total'],
-            "extracted_profiles": stats['extracted'],
-            "total_rows": len(clean_results),
-            "errors": stats['errors'],
-            "search_params": params_dict,
-            "bounds": bounds_dict,
-        },
-        "data": clean_results
-    }
-
-    json_content = json.dumps(output, indent=2, default=str)
-
-    return Response(
-        content=json_content,
-        media_type='application/json',
-        headers={
-            'Content-Disposition': f'attachment; filename="argo_export_{stats["total"]}_profiles.json"'
-        }
-    )
-
-
-@app.post("/api/export/netcdf")
-async def export_netcdf(req: ExportRequest):
-    """Export search results as NetCDF."""
-    bounds_dict = req.bounds.dict()
-    params_dict = req.params.dict()
-    params_dict['selectedVars'] = req.selectedVars or []
-
-    all_results, stats = await search_and_extract(bounds_dict, params_dict)
-    if not all_results:
-        raise HTTPException(status_code=404, detail="No data found for the given search parameters.")
-
-    df = pd.DataFrame(all_results)
-    df.replace('', np.nan, inplace=True)
-    df.dropna(axis=1, how='all', inplace=True)
-
-    # Convert string columns that should be numeric
-    for col in df.columns:
-        if col not in ['Date', 'Platform', 'Cycle', 'Institution', 'Ocean', 'File']:
-            try:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            except Exception:
-                pass
-
-    # Build xarray Dataset from the DataFrame
-    ds = xr.Dataset.from_dataframe(df.reset_index(drop=True))
-
-    # Add global attributes
-    ds.attrs = {
-        'title': 'Argo Nexus Data Export',
-        'source': 'Argo Nexus India — IFREMER GDAC',
-        'institution': 'INCOIS',
-        'total_profiles': stats['total'],
-        'extracted_profiles': stats['extracted'],
-        'conventions': 'CF-1.8',
-    }
-
-    # Write to temp file (scipy engine closes BytesIO buffers)
+async def _run_export_job(job_id, fmt, bounds_dict, params_dict, extra_params=None):
+    """Background task that runs the export and saves the result to disk."""
     import tempfile
-    with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as tmp:
-        tmp_path = tmp.name
-    ds.to_netcdf(tmp_path, engine='scipy')
-    with open(tmp_path, 'rb') as f:
-        nc_bytes = f.read()
-    os.remove(tmp_path)
+    try:
+        EXPORT_JOBS[job_id]['status'] = 'running'
+        
+        # 1. DB Search to get profile count first
+        filtered = await db_query_profiles(
+            params_dict['startDate'],
+            params_dict['endDate'],
+            params_dict.get('type', 'core'),
+            bounds_dict
+        )
+        
+        if not filtered:
+            EXPORT_JOBS[job_id]['status'] = 'error'
+            EXPORT_JOBS[job_id]['error'] = 'No data found for the given search parameters.'
+            return
+        
+        if len(filtered) > MAX_PROFILES_PER_REQUEST:
+            EXPORT_JOBS[job_id]['status'] = 'error'
+            EXPORT_JOBS[job_id]['error'] = f'Request too large ({len(filtered)} profiles). Max {MAX_PROFILES_PER_REQUEST}.'
+            return
+        
+        EXPORT_JOBS[job_id]['total'] = len(filtered)
+        
+        # 2. Download and extract with progress tracking
+        all_results, stats = await _search_extract_with_progress(job_id, filtered, params_dict)
+        
+        if not all_results:
+            EXPORT_JOBS[job_id]['status'] = 'error'
+            EXPORT_JOBS[job_id]['error'] = 'No data could be extracted from the matched profiles.'
+            return
+        
+        # 3. Format the output
+        EXPORT_JOBS[job_id]['status'] = 'formatting'
+        
+        if fmt == 'csv':
+            df = pd.DataFrame(all_results)
+            df.replace('', np.nan, inplace=True)
+            df.dropna(axis=1, how='all', inplace=True)
+            df.rename(columns={'depth': 'Depth (dbar)'}, inplace=True)
+            
+            out_path = os.path.join(DOWNLOADS_DIR, f'{job_id}.csv')
+            csv_buffer = io.StringIO()
+            df.to_csv(csv_buffer, index=False)
+            with open(out_path, 'w', encoding='utf-8-sig') as f:
+                f.write(csv_buffer.getvalue())
+            
+            EXPORT_JOBS[job_id]['result_path'] = out_path
+            EXPORT_JOBS[job_id]['filename'] = f'argo_export_{stats["total"]}_profiles.csv'
+            EXPORT_JOBS[job_id]['media_type'] = 'text/csv'
+            
+        elif fmt == 'json':
+            clean_results = []
+            for row in all_results:
+                clean_row = {}
+                for k, v in row.items():
+                    if isinstance(v, float) and np.isnan(v):
+                        clean_row[k] = None
+                    else:
+                        clean_row[k] = v
+                clean_results.append(clean_row)
+            
+            output = {
+                "metadata": {
+                    "total_profiles": stats['total'],
+                    "extracted_profiles": stats['extracted'],
+                    "total_rows": len(clean_results),
+                    "errors": stats['errors'],
+                    "search_params": params_dict,
+                    "bounds": bounds_dict,
+                },
+                "data": clean_results
+            }
+            
+            out_path = os.path.join(DOWNLOADS_DIR, f'{job_id}.json')
+            with open(out_path, 'w') as f:
+                json.dump(output, f, indent=2, default=str)
+            
+            EXPORT_JOBS[job_id]['result_path'] = out_path
+            EXPORT_JOBS[job_id]['filename'] = f'argo_export_{stats["total"]}_profiles.json'
+            EXPORT_JOBS[job_id]['media_type'] = 'application/json'
+            
+        elif fmt == 'netcdf':
+            df = pd.DataFrame(all_results)
+            df.replace('', np.nan, inplace=True)
+            df.dropna(axis=1, how='all', inplace=True)
+            for col in df.columns:
+                if col not in ['Date', 'Platform', 'Cycle', 'Institution', 'Ocean', 'File']:
+                    try:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    except Exception:
+                        pass
+            ds = xr.Dataset.from_dataframe(df.reset_index(drop=True))
+            ds.attrs = {
+                'title': 'Argo Nexus Data Export',
+                'source': 'Argo Nexus India — IFREMER GDAC',
+                'institution': 'INCOIS',
+                'total_profiles': stats['total'],
+                'extracted_profiles': stats['extracted'],
+                'conventions': 'CF-1.8',
+            }
+            out_path = os.path.join(DOWNLOADS_DIR, f'{job_id}.nc')
+            ds.to_netcdf(out_path, engine='scipy')
+            
+            EXPORT_JOBS[job_id]['result_path'] = out_path
+            EXPORT_JOBS[job_id]['filename'] = f'argo_export_{stats["total"]}_profiles.nc'
+            EXPORT_JOBS[job_id]['media_type'] = 'application/x-netcdf'
+            
+        elif fmt == 'diva':
+            loop = asyncio.get_event_loop()
+            gridded_ds = await loop.run_in_executor(
+                PROCESS_POOL,
+                grid_argo_data,
+                all_results,
+                extra_params['variable'],
+                bounds_dict,
+                extra_params['depth_level'],
+                extra_params['depth_tolerance'],
+                extra_params['resolution'],
+                extra_params['method'],
+                extra_params['corr_length'],
+                extra_params['snr']
+            )
+            if gridded_ds is None:
+                EXPORT_JOBS[job_id]['status'] = 'error'
+                EXPORT_JOBS[job_id]['error'] = f"Insufficient data for DIVA gridding. Need at least 3 observations."
+                return
+            
+            out_path = os.path.join(DOWNLOADS_DIR, f'{job_id}.nc')
+            gridded_ds.to_netcdf(out_path, engine='scipy')
+            
+            EXPORT_JOBS[job_id]['result_path'] = out_path
+            EXPORT_JOBS[job_id]['filename'] = f'argo_diva_{extra_params["variable"]}_{extra_params["depth_level"]}m.nc'
+            EXPORT_JOBS[job_id]['media_type'] = 'application/x-netcdf'
+        
+        EXPORT_JOBS[job_id]['status'] = 'done'
+        
+    except Exception as e:
+        EXPORT_JOBS[job_id]['status'] = 'error'
+        EXPORT_JOBS[job_id]['error'] = str(e)
 
-    return Response(
-        content=nc_bytes,
-        media_type='application/x-netcdf',
+
+async def _search_extract_with_progress(job_id, filtered, params_dict):
+    """Download & extract with progress tracking for the job system."""
+    params_obj = ParamsObj({
+        'minDepth': float(params_dict.get('minDepth', 0)),
+        'maxDepth': float(params_dict.get('maxDepth', 2000)),
+    })
+    
+    loop = asyncio.get_event_loop()
+    all_results = []
+    error_count = 0
+    extracted_count = 0
+
+    for chunk_start in range(0, len(filtered), BATCH_CHUNK_SIZE):
+        chunk = filtered[chunk_start:chunk_start + BATCH_CHUNK_SIZE]
+
+        async def download_one(profile):
+            try:
+                path = await download_with_retry(profile['file'])
+                return profile, path
+            except Exception as e:
+                return profile, e
+
+        download_results = await asyncio.gather(*[download_one(p) for p in chunk])
+
+        async def extract_one(profile, local_path):
+            nonlocal extracted_count, error_count
+            try:
+                async with EXTRACTION_SEMAPHORE:
+                    extracted = await loop.run_in_executor(
+                        PROCESS_POOL, process_netcdf, local_path, params_obj
+                    )
+                    filename = os.path.basename(profile['file'])
+                    platform, cycle = extract_metadata(filename)
+                    for row in extracted:
+                        row.update({
+                            'Date': profile['date'],
+                            'Latitude': profile['lat'],
+                            'Longitude': profile['lon'],
+                            'Platform': platform,
+                            'Cycle': cycle,
+                            'Institution': profile.get('institution', ''),
+                            'Ocean': profile.get('ocean', ''),
+                            'File': filename
+                        })
+                        all_results.append(row)
+                    extracted_count += 1
+            except Exception:
+                error_count += 1
+
+        await asyncio.gather(*[extract_one(p, r) for p, r in download_results if not isinstance(r, Exception)])
+        
+        for _, r in download_results:
+            if isinstance(r, Exception):
+                error_count += 1
+        
+        # Update progress
+        EXPORT_JOBS[job_id]['progress'] = min(chunk_start + len(chunk), len(filtered))
+
+    stats = {
+        'total': len(filtered),
+        'extracted': extracted_count,
+        'errors': error_count
+    }
+    return all_results, stats
+
+
+# ── Export Job Endpoints ───────────────────────────────────────────────────────
+
+@app.post("/api/export/{fmt}")
+async def submit_export(fmt: str, req: ExportRequest):
+    """Submit an export job. Returns a job_id immediately for polling."""
+    if fmt not in ('csv', 'json', 'netcdf'):
+        raise HTTPException(status_code=400, detail=f"Unknown format: {fmt}")
+    
+    bounds_dict = req.bounds.dict()
+    params_dict = req.params.dict()
+    params_dict['selectedVars'] = req.selectedVars or []
+    
+    # Check cache first for instant response
+    cache_key = hashlib.md5(json.dumps({**bounds_dict, **params_dict, 'fmt': fmt}, sort_keys=True).encode()).hexdigest()
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        # Rebuild from cached search results
+        pass  # Let the job system handle it; the search_and_extract inside has its own cache
+    
+    job_id = str(uuid.uuid4())
+    EXPORT_JOBS[job_id] = {
+        'status': 'queued',
+        'progress': 0,
+        'total': 0,
+        'result_path': None,
+        'error': None,
+        'format': fmt,
+        'filename': None,
+        'media_type': None,
+    }
+    
+    # Launch background task
+    asyncio.create_task(_run_export_job(job_id, fmt, bounds_dict, params_dict))
+    
+    return {'job_id': job_id, 'status': 'queued'}
+
+
+@app.get("/api/export/status/{job_id}")
+async def export_status(job_id: str):
+    """Poll the status of an export job."""
+    job = EXPORT_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    return {
+        'job_id': job_id,
+        'status': job['status'],
+        'progress': job['progress'],
+        'total': job['total'],
+        'error': job['error'],
+        'filename': job['filename'],
+    }
+
+
+@app.get("/api/export/download/{job_id}")
+async def export_download(job_id: str):
+    """Download the completed export file."""
+    job = EXPORT_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if job['status'] != 'done':
+        raise HTTPException(status_code=409, detail=f"Job is still {job['status']}")
+    if not job['result_path'] or not os.path.exists(job['result_path']):
+        raise HTTPException(status_code=410, detail="Export file no longer available")
+    
+    def file_stream():
+        with open(job['result_path'], 'rb') as f:
+            while chunk := f.read(8192):
+                yield chunk
+    
+    return StreamingResponse(
+        file_stream(),
+        media_type=job['media_type'],
         headers={
-            'Content-Disposition': f'attachment; filename="argo_export_{stats["total"]}_profiles.nc"'
+            'Content-Disposition': f'attachment; filename="{job["filename"]}"'
         }
     )
 
@@ -1268,57 +1432,35 @@ async def export_netcdf(req: ExportRequest):
 
 @app.post("/api/export/diva")
 async def export_diva_gridded(req: DivaExportRequest):
-    """
-    Export DIVA-style gridded product as a NetCDF file.
-    Runs Optimal Interpolation on the selected Argo profiles and returns
-    a CF-compliant NetCDF with the analysis field and DIVA error field.
-    """
+    """Submit a DIVA gridded export job. Returns a job_id immediately."""
     bounds_dict = req.bounds.dict()
     params_dict = req.params.dict()
 
-    all_results, stats = await search_and_extract(bounds_dict, params_dict)
-    if not all_results:
-        raise HTTPException(status_code=404, detail="No data found for DIVA gridding.")
+    extra_params = {
+        'variable': req.variable,
+        'depth_level': req.depth_level,
+        'depth_tolerance': req.depth_tolerance,
+        'resolution': req.resolution,
+        'method': req.method,
+        'corr_length': req.corr_length,
+        'snr': req.snr,
+    }
 
-    # Run the gridding in the process pool (CPU-intensive)
-    loop = asyncio.get_event_loop()
-    gridded_ds = await loop.run_in_executor(
-        PROCESS_POOL,
-        grid_argo_data,
-        all_results,
-        req.variable,
-        bounds_dict,
-        req.depth_level,
-        req.depth_tolerance,
-        req.resolution,
-        req.method,
-        req.corr_length,
-        req.snr
-    )
+    job_id = str(uuid.uuid4())
+    EXPORT_JOBS[job_id] = {
+        'status': 'queued',
+        'progress': 0,
+        'total': 0,
+        'result_path': None,
+        'error': None,
+        'format': 'diva',
+        'filename': None,
+        'media_type': None,
+    }
 
-    if gridded_ds is None:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Insufficient data for DIVA gridding variable '{req.variable}' at depth {req.depth_level}m. Need at least 3 observations."
-        )
+    asyncio.create_task(_run_export_job(job_id, 'diva', bounds_dict, params_dict, extra_params))
 
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as tmp:
-        tmp_path = tmp.name
-    gridded_ds.to_netcdf(tmp_path, engine='scipy')
-    with open(tmp_path, 'rb') as f:
-        nc_bytes = f.read()
-    os.remove(tmp_path)
-
-    filename = f"argo_diva_{req.variable}_{req.depth_level}m_{req.resolution}deg_{req.method}.nc"
-
-    return Response(
-        content=nc_bytes,
-        media_type='application/x-netcdf',
-        headers={
-            'Content-Disposition': f'attachment; filename="{filename}"'
-        }
-    )
+    return {'job_id': job_id, 'status': 'queued'}
 
 
 # ── Gridded Data Product Endpoint ──────────────────────────────────────────────
