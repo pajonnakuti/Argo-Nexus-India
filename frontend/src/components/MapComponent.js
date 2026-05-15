@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { MapContainer, TileLayer, FeatureGroup, CircleMarker, Polyline, Tooltip, useMap, Marker } from 'react-leaflet';
 import { EditControl } from 'react-leaflet-draw';
 import L from 'leaflet';
@@ -59,8 +59,8 @@ const ActiveFloatsControl = ({ showActive, setShowActive, showInactive, setShowI
 
         container.innerHTML = `
           <div class="active-floats-dropdown">
-            <button class="active-floats-btn ${showActive ? 'active' : ''}" title="Toggle Active Floats">
-              📡 ${showActive ? 'Hide' : 'Show'} Active Floats ${floatCounts.total > 0 ? `(${floatCounts.total})` : ''} ${badge}
+            <button class="active-floats-btn ${showActive ? 'active' : ''}" title="Toggle Floats">
+              📡 ${showActive ? 'Hide' : 'Show'} Floats ${floatCounts.total > 0 ? `(${showInactive ? floatCounts.total : floatCounts.active})` : ''} ${badge}
               <span class="dropdown-arrow">▼</span>
             </button>
             <div class="dropdown-content ${showActive ? 'show' : ''}">
@@ -237,48 +237,10 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
   const [floatFilter, setFloatFilter] = useState('all');
   const [oceanFilter, setOceanFilter] = useState('all');
   const [instFilter, setInstFilter] = useState('all');
-  const [floatCounts, setFloatCounts] = useState({ total: 0, core: 0, bgc: 0, ocean: {}, inst: {}, incoisTotal: 0, incoisVisible: 0 });
+  const [floatCounts, setFloatCounts] = useState({ total: 0, active: 0, core: 0, bgc: 0, activeCore: 0, activeBgc: 0, ocean: {}, inst: {}, incoisTotal: 0, incoisVisible: 0, bgcParams: {} });
 
-  const incoisFloats = useMemo(() => {
-    const incois = activeFloats.filter(f => {
-      const platform = String(f.platform || '').toUpperCase();
-      const argoIndex = String(f.argo_prof_index || f.argo_prof_index_name || '').toUpperCase();
-      return platform.startsWith('IN') || argoIndex.includes('IN');
-    });
-
-    const unique = [];
-    const seen = new Set();
-    incois.forEach(f => {
-      const id = String(f.platform || '').toUpperCase();
-      if (id && !seen.has(id)) {
-        seen.add(id);
-        unique.push(f);
-      }
-    });
-    return unique.length > 0 ? unique : activeFloats;
-  }, [activeFloats]);
-
-  const parameterCounts = useMemo(() => {
-    const counts = { NO3: 0, DOXY: 0, CHLA: 0, BBP700: 0 };
-    incoisFloats.forEach((float) => {
-      const params = float.parameters || float.params || float.parameter_list || [];
-      const paramList = Array.isArray(params) ? params.map(p => String(p).toUpperCase()) : [];
-
-      if (paramList.includes('NITRATE') || paramList.includes('NO3') || float.NITRATE || float.NO3) {
-        counts.NO3 += 1;
-      }
-      if (paramList.includes('DOXY') || float.DOXY) {
-        counts.DOXY += 1;
-      }
-      if (paramList.includes('CHLA') || float.CHLA) {
-        counts.CHLA += 1;
-      }
-      if (paramList.includes('BBP700') || float.BBP700) {
-        counts.BBP700 += 1;
-      }
-    });
-    return counts;
-  }, [incoisFloats]);
+  // BGC parameter counts come from the server (pre-computed from bio index)
+  const parameterCounts = floatCounts.bgcParams || { NO3: 0, DOXY: 0, CHLA: 0, BBP700: 0 };
 
   // Trajectory state
   const [selectedFloat, setSelectedFloat] = useState(null);
@@ -302,30 +264,26 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
     fetch(url)
       .then(res => res.json())
       .then(data => {
-          // Count truly active floats (pinged in last 90 days)
-          const trulyActiveCount = data.floats.filter(f => f.status === 'active').length;
-          const trulyActiveCore = data.floats.filter(f => f.status === 'active' && f.type === 'core').length;
-          const trulyActiveBgc = data.floats.filter(f => f.status === 'active' && f.type === 'bgc').length;
-
           const counts = {
-            totalQueried: data.count || 0,
-            totalActive: trulyActiveCount,
-            activeCore: trulyActiveCore,
-            activeBgc: trulyActiveBgc,
+            total: data.count || 0,
+            active: data.active_count || 0,
             core: data.core_count || 0,
             bgc: data.bgc_count || 0,
+            activeCore: data.active_core_count || 0,
+            activeBgc: data.active_bgc_count || 0,
             ocean: data.ocean_counts || {},
             inst: data.inst_counts || {},
             incoisTotal: data.incois_total || 0,
-            incoisVisible: data.incois_visible || 0
+            incoisVisible: data.incois_visible || 0,
+            bgcParams: data.bgc_parameter_counts || { NO3: 0, DOXY: 0, CHLA: 0, BBP700: 0 }
           };
-          setActiveFloats(data.floats);
+          setActiveFloats(data.floats || []);
           setFloatCounts(counts);
           if (onFloatCountsUpdate) onFloatCountsUpdate(counts);
       })
       .catch(err => console.error("Failed to load active floats:", err))
       .finally(() => setIsMapLoading(false));
-  }, [startDate, endDate]);
+  }, [startDate, endDate]); // Re-fetch when sidebar dates change
 
   // Sync bounding-box rectangle
   useEffect(() => {
@@ -446,6 +404,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
         zoom={5}
         style={{ height: '100vh', width: '100%' }}
         ref={mapRef}
+        preferCanvas={true}
         whenCreated={(mapInstance) => { mapRef.current = mapInstance; }}
       >
         <TileLayer

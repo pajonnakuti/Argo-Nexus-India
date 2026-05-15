@@ -28,6 +28,10 @@ from filelock import FileLock
 import hashlib
 import shutil
 
+# ── Global Caches ─────────────────────────────────────────────────────────────
+ACTIVE_FLOATS_CACHE = {}  # key: "start_end", value: {'response': dict, 'timestamp': float, 'ttl': 1800}
+BGC_PARAM_COUNTS = {'NO3': 0, 'DOXY': 0, 'CHLA': 0, 'BBP700': 0, 'PH': 0}
+
 async def cleanup_task():
     """Background task to enforce 20GB size limit on downloads directory (LRU)."""
     MAX_SIZE = 20 * 1024 * 1024 * 1024 # 20 GB
@@ -69,6 +73,8 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(120.0, connect=30.0),
     )
     await init_db()
+    # Precompute active floats in background — don't block server startup
+    asyncio.create_task(precompute_active_floats())
     task = asyncio.create_task(cleanup_task())
     yield
     task.cancel()
@@ -110,6 +116,11 @@ BGC_PLATFORMS = set()
 async def init_db():
     """Initializes SQLite database and syncs from .txt files if needed."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # WAL mode for concurrent read performance
+        await db.execute('PRAGMA journal_mode=WAL')
+        await db.execute('PRAGMA cache_size=-64000')  # 64MB cache
+        await db.execute('PRAGMA synchronous=NORMAL')
+
         await db.execute('''
             CREATE TABLE IF NOT EXISTS profiles (
                 file TEXT PRIMARY KEY,
@@ -139,41 +150,23 @@ async def init_db():
         await db.execute('CREATE INDEX IF NOT EXISTS idx_meta_inst ON metadata(institution)')
         await db.commit()
 
-        # Check if we need to sync profiles
+        # Only sync if DB is empty — never resync automatically on mtime
         cursor = await db.execute('SELECT COUNT(*) FROM profiles')
         count = (await cursor.fetchone())[0]
-        
-        needs_sync = count == 0
-        if not needs_sync:
-            for path in [LOCAL_INDEX_PATH, BIO_INDEX_PATH]:
-                if os.path.exists(path) and os.path.getmtime(path) > os.path.getmtime(DB_PATH):
-                    needs_sync = True
-                    break
-        
-        if needs_sync:
-            print("Syncing SQLite DB from index files...")
+        if count == 0:
+            print("DB empty — syncing from index files...")
             await sync_index_to_db(db)
 
-        # Check if we need to sync metadata
         cursor = await db.execute('SELECT COUNT(*) FROM metadata')
         meta_count = (await cursor.fetchone())[0]
-        
-        needs_meta_sync = meta_count == 0
-        if not needs_meta_sync and os.path.exists(META_INDEX_PATH):
-            if os.path.getmtime(META_INDEX_PATH) > os.path.getmtime(DB_PATH):
-                needs_meta_sync = True
-        
-        if needs_meta_sync:
-            print("Syncing metadata from ar_index_global_meta.txt...")
+        if meta_count == 0:
+            print("Metadata empty — syncing from ar_index_global_meta.txt...")
             await sync_metadata_to_db(db)
             
         # Load BGC platforms into memory for quick lookup
-        cursor = await db.execute("SELECT file FROM profiles WHERE type='bio'")
+        cursor = await db.execute("SELECT DISTINCT platform FROM profiles WHERE type='bio'")
         async for row in cursor:
-            filename = os.path.basename(row[0])
-            match = re.search(r'([A-Z]*)([0-9]+)_([0-9]+D?)', filename)
-            if match:
-                BGC_PLATFORMS.add(match.group(2))
+            BGC_PLATFORMS.add(row[0])
         print(f"Loaded {len(BGC_PLATFORMS)} BGC platforms")
         
         # Log metadata counts for verification
@@ -182,6 +175,61 @@ async def init_db():
         cursor = await db.execute("SELECT COUNT(*) FROM metadata WHERE institution = 'IN'")
         incois_meta = (await cursor.fetchone())[0]
         print(f"Metadata: {total_meta} total floats, {incois_meta} INCOIS floats")
+
+    # Load BGC parameter coverage counts from bio index file
+    await load_bgc_parameter_counts()
+
+
+async def load_bgc_parameter_counts():
+    """Scans argo_bio-profile_index.txt to count platforms per BGC parameter."""
+    global BGC_PARAM_COUNTS
+    if not os.path.exists(BIO_INDEX_PATH):
+        return
+    platform_params = {}  # platform -> set of param names
+    with open(BIO_INDEX_PATH, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith('#') or line.startswith('file,') or not line.strip():
+                continue
+            parts = line.split(',')
+            if len(parts) >= 8:
+                try:
+                    platform = parts[0].split('/')[1]
+                    params_str = parts[7].strip() if len(parts) > 7 else ''
+                    if platform not in platform_params:
+                        platform_params[platform] = set()
+                    for p in params_str.split():
+                        platform_params[platform].add(p.upper())
+                except (IndexError, ValueError):
+                    continue
+    counts = {'NO3': 0, 'DOXY': 0, 'CHLA': 0, 'BBP700': 0, 'PH': 0}
+    for platform, pset in platform_params.items():
+        if 'NITRATE' in pset or 'NO3' in pset:
+            counts['NO3'] += 1
+        if 'DOXY' in pset:
+            counts['DOXY'] += 1
+        if 'CHLA' in pset:
+            counts['CHLA'] += 1
+        if 'BBP700' in pset:
+            counts['BBP700'] += 1
+        if 'PH_IN_SITU_TOTAL' in pset or 'PH' in pset:
+            counts['PH'] += 1
+    BGC_PARAM_COUNTS = counts
+    print(f"BGC parameter coverage: {counts}")
+
+
+async def precompute_active_floats():
+    """Precomputes the global active floats cache at startup."""
+    global ACTIVE_FLOATS_CACHE
+    print("Precomputing global active floats cache...")
+    t0 = time.time()
+    response = await _build_active_floats_response(None, None)
+    ACTIVE_FLOATS_CACHE['global'] = {
+        'response': response,
+        'timestamp': time.time(),
+        'ttl': 1800
+    }
+    elapsed = time.time() - t0
+    print(f"Active floats cache ready: {response['count']} platforms in {elapsed:.1f}s")
 
 async def sync_index_to_db(db):
     """Parses .txt files and inserts into SQLite."""
@@ -301,8 +349,8 @@ HTTP_CLIENT: httpx.AsyncClient = None
 PROCESS_POOL = ProcessPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) + 4))
 EXTRACTION_SEMAPHORE = asyncio.Semaphore(min(16, (os.cpu_count() or 4) * 2))
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(100) # Global download limit
-MAX_PROFILES_PER_REQUEST = 5000
-BATCH_CHUNK_SIZE = 100  # Smaller chunks for better streaming
+MAX_PROFILES_PER_REQUEST = 50000  # Support large 20-year queries
+BATCH_CHUNK_SIZE = 200  # Larger chunks for throughput
 MAX_DOWNLOAD_RETRIES = 3
 
 # Cache and DB paths
@@ -766,10 +814,8 @@ async def websocket_endpoint(websocket: WebSocket):
         except:
             pass
 
-@app.get("/api/active_floats")
-@limiter.limit("30/minute")
-async def get_active_floats(request: Request, startDate: Optional[str] = None, endDate: Optional[str] = None):
-    """Returns the latest location of all floats, colored by active/inactive based on 90 days."""
+async def _build_active_floats_response(startDate: Optional[str], endDate: Optional[str]):
+    """Builds the active floats response object. Used by cache and endpoint."""
     
     if not endDate:
         end_dt = datetime.utcnow()
@@ -786,45 +832,60 @@ async def get_active_floats(request: Request, startDate: Optional[str] = None, e
 
     ninety_days_ago = (end_dt - timedelta(days=90)).strftime("%Y%m%d%H%M%S")
 
-    # Optimized query leveraging the new platform column and compound index
-    query = '''
-        SELECT * FROM (
-            SELECT *, ROW_NUMBER() OVER(PARTITION BY platform ORDER BY date DESC) as rn
-            FROM profiles 
-            WHERE date BETWEEN ? AND ?
-            AND lat BETWEEN -90 AND 90 
-            AND lon BETWEEN -180 AND 180
-        ) WHERE rn = 1
-    '''
-    
+    # Single DB connection for entire computation
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('PRAGMA journal_mode=WAL')
         db.row_factory = aiosqlite.Row
-        async with db.execute(query, [start_str, end_str]) as cursor:
+
+        # Fast query: GROUP BY platform to get latest date within range, then join back
+        query = '''
+            SELECT p.file, p.platform, p.date, p.lat, p.lon, p.ocean, 
+                   p.profiler_type, p.institution, p.type
+            FROM profiles p
+            INNER JOIN (
+                SELECT platform, MAX(date) as max_date
+                FROM profiles
+                WHERE date BETWEEN ? AND ?
+                AND lat BETWEEN -90 AND 90
+                AND lon BETWEEN -180 AND 180
+                GROUP BY platform
+            ) latest ON p.platform = latest.platform AND p.date = latest.max_date
+            WHERE p.date BETWEEN ? AND ?
+            AND p.lat BETWEEN -90 AND 90
+            AND p.lon BETWEEN -180 AND 180
+            GROUP BY p.platform
+        '''
+        async with db.execute(query, [start_str, end_str, start_str, end_str]) as cursor:
             rows = await cursor.fetchall()
-            
-    # Fetch all metadata into a dict for authoritative institution mapping
-    meta_dict = {}
-    async with aiosqlite.connect(DB_PATH) as db:
+
+        # Fetch all metadata for institution mapping
+        meta_dict = {}
         cursor = await db.execute("SELECT platform, institution FROM metadata")
         async for r in cursor:
             meta_dict[r[0]] = r[1]
-            
+
+        # INCOIS total from metadata
+        cursor = await db.execute("SELECT COUNT(*) FROM metadata WHERE institution = 'IN'")
+        incois_total = (await cursor.fetchone())[0]
+
+    # Process rows
     active_floats = []
     ocean_counts = {}
     inst_counts = {}
-    core_count = 0
-    bgc_count = 0
-    
+    total_core = 0
+    total_bgc = 0
+    active_core = 0
+    active_bgc = 0
+    active_count = 0
+    incois_visible = 0
+
     for row in rows:
         filename = os.path.basename(row['file'])
         platform, cycle = extract_metadata(filename)
         is_bgc = platform in BGC_PLATFORMS
-        
-        # Use authoritative institution from metadata, fallback to profile index
         inst = meta_dict.get(platform, row['institution'])
-        
-        status = 'active' if row['date'] >= ninety_days_ago else 'inactive'
-        
+        is_active = row['date'] >= ninety_days_ago
+
         f_data = {
             'platform': platform,
             'cycle': cycle,
@@ -834,51 +895,114 @@ async def get_active_floats(request: Request, startDate: Optional[str] = None, e
             'institution': inst,
             'ocean': row['ocean'],
             'type': 'bgc' if is_bgc else 'core',
-            'status': status
+            'status': 'active' if is_active else 'inactive'
         }
         active_floats.append(f_data)
-        
-        if is_bgc: bgc_count += 1
-        else: core_count += 1
-        
+
+        if is_bgc:
+            total_bgc += 1
+        else:
+            total_core += 1
+
+        if is_active:
+            active_count += 1
+            if is_bgc:
+                active_bgc += 1
+            else:
+                active_core += 1
+
+        if inst == 'IN':
+            incois_visible += 1
+
         o = row['ocean']
-        i = inst
         ocean_counts[o] = ocean_counts.get(o, 0) + 1
-        inst_counts[i] = inst_counts.get(i, 0) + 1
+        inst_counts[inst] = inst_counts.get(inst, 0) + 1
 
     ocean_labels = {'I': 'Indian', 'P': 'Pacific', 'A': 'Atlantic', '': 'Unknown'}
 
-    # Get authoritative INCOIS float count from metadata table
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM metadata WHERE institution = 'IN'")
-        incois_total = (await cursor.fetchone())[0]
-    
-    # Also count how many of the currently visible floats are INCOIS
-    # Cross-reference platform IDs against the metadata table
-    platform_ids = list(set(f['platform'] for f in active_floats))
-    incois_visible = 0
-    if platform_ids:
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Query in batches to avoid SQL parameter limits
-            for i in range(0, len(platform_ids), 500):
-                chunk = platform_ids[i:i+500]
-                placeholders = ','.join('?' * len(chunk))
-                cursor = await db.execute(
-                    f"SELECT COUNT(*) FROM metadata WHERE institution = 'IN' AND platform IN ({placeholders})",
-                    chunk
-                )
-                incois_visible += (await cursor.fetchone())[0]
-
     return {
-        "count": len(active_floats), 
-        "core_count": core_count,
-        "bgc_count": bgc_count,
+        "count": len(active_floats),
+        "active_count": active_count,
+        "core_count": total_core,
+        "bgc_count": total_bgc,
+        "active_core_count": active_core,
+        "active_bgc_count": active_bgc,
         "ocean_counts": {ocean_labels.get(k, k): v for k, v in sorted(ocean_counts.items(), key=lambda x: -x[1])},
         "inst_counts": dict(sorted(inst_counts.items(), key=lambda x: -x[1])),
         "incois_total": incois_total,
         "incois_visible": incois_visible,
+        "bgc_parameter_counts": BGC_PARAM_COUNTS,
         "floats": active_floats
     }
+
+
+@app.get("/api/active_floats")
+@limiter.limit("30/minute")
+async def get_active_floats(request: Request, startDate: Optional[str] = None, endDate: Optional[str] = None):
+    """Returns the latest position of floats within the date range.
+    Active/inactive is determined by 90 days from the endDate.
+    Result is cached for 30 minutes for instant responses."""
+    global ACTIVE_FLOATS_CACHE
+    now = time.time()
+    
+    cache_key = f"{startDate}_{endDate}" if startDate or endDate else "global"
+    
+    if len(ACTIVE_FLOATS_CACHE) > 50:
+        # Prevent memory leak from arbitrary date combos
+        ACTIVE_FLOATS_CACHE.clear()
+        
+    cache_entry = ACTIVE_FLOATS_CACHE.get(cache_key)
+    
+    if not cache_entry or (now - cache_entry['timestamp']) > cache_entry['ttl']:
+        response = await _build_active_floats_response(startDate, endDate)
+        ACTIVE_FLOATS_CACHE[cache_key] = {
+            'response': response,
+            'timestamp': now,
+            'ttl': 1800
+        }
+        return response
+        
+    return cache_entry['response']
+
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint for monitoring."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM profiles")
+        profile_count = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM metadata")
+        meta_count = (await cursor.fetchone())[0]
+    return {
+        "status": "ok",
+        "profiles": profile_count,
+        "metadata": meta_count,
+        "bgc_platforms": len(BGC_PLATFORMS),
+        "bgc_params": BGC_PARAM_COUNTS,
+    }
+
+
+@app.post("/api/admin/resync")
+async def admin_resync():
+    """Manual trigger to rebuild SQLite DB from index files. Use when index files are updated."""
+    global ACTIVE_FLOATS_CACHE
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('PRAGMA journal_mode=WAL')
+        print("Admin resync: rebuilding profiles...")
+        await db.execute("DELETE FROM profiles")
+        await sync_index_to_db(db)
+        print("Admin resync: rebuilding metadata...")
+        await db.execute("DELETE FROM metadata")
+        await sync_metadata_to_db(db)
+    BGC_PLATFORMS.clear()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT DISTINCT platform FROM profiles WHERE type='bio'")
+        async for row in cursor:
+            BGC_PLATFORMS.add(row[0])
+    await load_bgc_parameter_counts()
+    ACTIVE_FLOATS_CACHE.clear()
+    await precompute_active_floats()
+    return {"status": "resynced", "bgc_platforms": len(BGC_PLATFORMS)}
 
 @app.get("/api/trajectory/{platform_id}")
 @limiter.limit("20/minute")

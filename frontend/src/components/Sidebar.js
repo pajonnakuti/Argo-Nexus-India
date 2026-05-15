@@ -109,12 +109,12 @@ const Sidebar = ({
         {/* Mini Status Block */}
         <div className="mini-status" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px' }}>
           <div className="stat-block">
-            <div className="stat-label" style={{ fontSize: '10px' }}>TOTAL IN<br/>RANGE</div>
-            <div className="stat-value">{floatCounts?.totalQueried?.toLocaleString() || '—'}</div>
+            <div className="stat-label" style={{ fontSize: '10px' }}>TOTAL<br/>FLOATS</div>
+            <div className="stat-value">{floatCounts?.total?.toLocaleString() || '—'}</div>
           </div>
           <div className="stat-block">
             <div className="stat-label" style={{ fontSize: '10px' }}>TRULY<br/>ACTIVE</div>
-            <div className="stat-value" style={{ color: '#059669' }}>{floatCounts?.totalActive?.toLocaleString() || '—'}</div>
+            <div className="stat-value" style={{ color: '#059669' }}>{floatCounts?.active?.toLocaleString() || '—'}</div>
           </div>
           <div className="stat-block">
             <div className="stat-label" style={{ fontSize: '10px' }}>ACTIVE<br/>CORE</div>
