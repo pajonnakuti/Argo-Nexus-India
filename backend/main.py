@@ -821,10 +821,8 @@ async def websocket_endpoint(websocket: WebSocket):
 async def _build_active_floats_response(startDate: Optional[str], endDate: Optional[str]):
     """Builds the active floats response object. Used by cache and endpoint.
     
-    Logic: Always shows floats active within 90 days of endDate.
-    The startDate parameter is IGNORED for active float display — the map
-    always shows a 90-day lookback window from endDate (or today).
-    This ensures that setting date to "today" still shows all active floats.
+    Logic: Shows floats active within the provided startDate and endDate.
+    If startDate is not provided, defaults to a 45-day lookback window from endDate.
     """
     
     if not endDate:
@@ -834,10 +832,14 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
         
     end_str = end_dt.strftime("%Y%m%d") + "235959"
     
-    # ALWAYS look back 45 days from endDate for active float display
-    # This aligns with the official Argo Information Centre's definition of an operational float
-    active_window_dt = end_dt - timedelta(days=45)
-    start_str = active_window_dt.strftime("%Y%m%d") + "000000"
+    if startDate:
+        start_dt = datetime.strptime(startDate, "%Y-%m-%d")
+    else:
+        # Default look back 45 days from endDate for active float display
+        # This aligns with the official Argo Information Centre's definition of an operational float
+        start_dt = end_dt - timedelta(days=45)
+        
+    start_str = start_dt.strftime("%Y%m%d") + "000000"
 
     # Single DB connection for entire computation
     async with aiosqlite.connect(DB_PATH) as db:

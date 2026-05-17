@@ -39,7 +39,7 @@ const ActiveFloatsControl = ({ showActive, setShowActive, showInactive, setShowI
   oceanEntries.sort((a, b) => b[1] - a[1]);
 
   return (
-    <div className="leaflet-bar leaflet-control custom-control active-floats-control-wrapper" style={{ position: 'absolute', top: 10, right: 10, zIndex: 1000, margin: 0 }}>
+    <div className="leaflet-bar leaflet-control custom-control active-floats-control-wrapper" style={{ position: 'absolute', top: 120, right: 10, zIndex: 1000, margin: 0 }}>
       <div className="active-floats-dropdown">
         <button 
           className={`active-floats-btn ${showActive ? 'active' : ''}`} 
@@ -239,8 +239,11 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
     if (bounds && featureGroupRef.current && mapRef.current &&
       typeof bounds.north === 'number' && typeof bounds.south === 'number' &&
       typeof bounds.east === 'number' && typeof bounds.west === 'number') {
-      featureGroupRef.current.clearLayers();
-      if (bounds.north > bounds.south && bounds.east > bounds.west) {
+      
+      const layers = featureGroupRef.current.getLayers();
+      // Only recreate the rectangle programmatically if it doesn't exist in the FeatureGroup
+      // This prevents destroying the EditControl's internal reference when the user draws it manually.
+      if (layers.length === 0) {
         const rectangle = L.rectangle([
           [bounds.south, bounds.west],
           [bounds.north, bounds.east]
@@ -249,20 +252,22 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
           weight: 2,
           fillOpacity: 0.2
         });
-        rectangle.editing.enable();
-        rectangle.on('edit', (e) => {
-          const editedBounds = e.target.getBounds();
-          onBoundsChange({
-            north: editedBounds.getNorth(),
-            south: editedBounds.getSouth(),
-            east: editedBounds.getEast(),
-            west: editedBounds.getWest()
-          });
-        });
         featureGroupRef.current.addLayer(rectangle);
+      } else {
+        // If it exists, just update its bounds to match
+        layers.forEach(layer => {
+          if (layer instanceof L.Rectangle) {
+            layer.setBounds([
+              [bounds.south, bounds.west],
+              [bounds.north, bounds.east]
+            ]);
+          }
+        });
       }
+    } else if (!bounds && featureGroupRef.current) {
+      featureGroupRef.current.clearLayers();
     }
-  }, [bounds, onBoundsChange, is3D]);
+  }, [bounds, is3D]);
 
   const onCreate = (e) => {
     const { layerType, layer } = e;

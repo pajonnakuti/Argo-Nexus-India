@@ -17,21 +17,26 @@ const GlobeView = ({
 }) => {
   const globeRef = useRef();
   const [globeReady, setGlobeReady] = useState(false);
+  const [isTransitioning, setIsTransitioning] = useState(false);
 
   // Set initial view to India on load
   useEffect(() => {
     if (globeRef.current && globeReady) {
+      setIsTransitioning(true);
       globeRef.current.pointOfView({ lat: 20, lng: 78, altitude: 2.5 }, 1000);
+      setTimeout(() => setIsTransitioning(false), 1100);
     }
   }, [globeReady]);
 
   // Fly to selected float
   useEffect(() => {
     if (selectedFloat && globeRef.current) {
+      setIsTransitioning(true);
       globeRef.current.pointOfView(
         { lat: selectedFloat.lat, lng: selectedFloat.lon, altitude: 1.2 },
         1200
       );
+      setTimeout(() => setIsTransitioning(false), 1300);
     }
   }, [selectedFloat]);
 
@@ -73,13 +78,15 @@ const GlobeView = ({
     for (let i = 0; i < trajectoryPoints.length - 1; i++) {
       const from = trajectoryPoints[i];
       const to = trajectoryPoints[i + 1];
-      arcs.push({
-        startLat: from.lat,
-        startLng: from.lon,
-        endLat: to.lat,
-        endLng: to.lon,
-        cycle: to.cycle
-      });
+      if (from.lat != null && from.lon != null && to.lat != null && to.lon != null) {
+        arcs.push({
+          startLat: from.lat,
+          startLng: from.lon,
+          endLat: to.lat,
+          endLng: to.lon,
+          cycle: to.cycle
+        });
+      }
     }
     return arcs;
   }, [trajectoryPoints]);
@@ -87,7 +94,9 @@ const GlobeView = ({
   // Trajectory waypoint labels (shown as HTML labels on the globe)
   const labelData = useMemo(() => {
     if (!trajectoryPoints) return [];
-    return trajectoryPoints.map((pt, idx) => ({
+    return trajectoryPoints
+      .filter(pt => pt.lat != null && pt.lon != null)
+      .map((pt, idx) => ({
       lat: pt.lat,
       lng: pt.lon,
       cycle: pt.cycle,
@@ -133,21 +142,27 @@ const GlobeView = ({
   // Navigation controls
   const flyToIndia = useCallback(() => {
     if (globeRef.current) {
+      setIsTransitioning(true);
       globeRef.current.pointOfView({ lat: 20, lng: 78, altitude: 2.5 }, 1500);
+      setTimeout(() => setIsTransitioning(false), 1600);
     }
   }, []);
 
   const zoomIn = useCallback(() => {
     if (globeRef.current) {
+      setIsTransitioning(true);
       const pov = globeRef.current.pointOfView();
       globeRef.current.pointOfView({ ...pov, altitude: pov.altitude * 0.6 }, 400);
+      setTimeout(() => setIsTransitioning(false), 500);
     }
   }, []);
 
   const zoomOut = useCallback(() => {
     if (globeRef.current) {
+      setIsTransitioning(true);
       const pov = globeRef.current.pointOfView();
       globeRef.current.pointOfView({ ...pov, altitude: Math.min(pov.altitude * 1.5, 5) }, 400);
+      setTimeout(() => setIsTransitioning(false), 500);
     }
   }, []);
 
@@ -198,7 +213,7 @@ const GlobeView = ({
         backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
         
         // Active float points
-        pointsData={filteredFloats}
+        pointsData={isTransitioning ? [] : filteredFloats}
         pointLat="lat"
         pointLng="lon"
         pointColor={pointColor}
@@ -209,7 +224,7 @@ const GlobeView = ({
         pointsMerge={false}
         
         // Trajectory arcs between consecutive waypoints
-        arcsData={arcData}
+        arcsData={isTransitioning ? [] : arcData}
         arcStartLat="startLat"
         arcStartLng="startLng"
         arcEndLat="endLat"
@@ -221,18 +236,20 @@ const GlobeView = ({
         arcDashAnimateTime={2000}
         arcAltitudeAutoScale={0.15}
 
-        // Trajectory waypoint dots via HTML labels
-        htmlElementsData={labelData}
-        htmlLat="lat"
-        htmlLng="lng"
-        htmlAltitude={0.01}
-        htmlElement={labelElement}
+        // Trajectory waypoint glowing rings (WebGL, completely crash-free and performant)
+        ringsData={isTransitioning ? [] : labelData}
+        ringLat="lat"
+        ringLng="lng"
+        ringColor={d => d.isLast ? '#ca8a04' : '#ef4444'}
+        ringMaxRadius={d => d.isLast ? 0.8 : 0.4}
+        ringPropagationSpeed={1.5}
+        ringRepeatPeriod={800}
         
         // Waypoint tooltips via labels layer
-        labelsData={labelData}
+        labelsData={isTransitioning ? [] : labelData}
         labelLat="lat"
         labelLng="lng"
-        labelText="cycle"
+        labelText={d => d.cycle != null ? d.cycle.toString() : ''}
         labelSize={d => d.isLast ? 1.0 : 0.6}
         labelColor={() => 'rgba(255,255,255,0.8)'}
         labelDotRadius={0}
@@ -279,3 +296,4 @@ const GlobeView = ({
 };
 
 export default GlobeView;
+
