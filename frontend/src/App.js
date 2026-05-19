@@ -113,15 +113,30 @@ function App() {
       while (status !== 'done' && status !== 'error') {
         await new Promise(r => setTimeout(r, 2000)); // Poll every 2s
         const pollResp = await fetch(`http://localhost:8000/api/export/status/${job_id}`);
+        
+        if (!pollResp.ok) {
+          throw new Error(`Export job lost (server returned ${pollResp.status}). Please retry.`);
+        }
+        
         const pollData = await pollResp.json();
         status = pollData.status;
 
         if (status === 'running') {
-          const pct = pollData.total > 0 ? Math.round((pollData.progress / pollData.total) * 100) : 0;
-          setLogs(prev => {
-            const filtered = prev.filter(l => !l.startsWith('⏳'));
-            return [...filtered, `⏳ Processing: ${pollData.progress}/${pollData.total} profiles (${pct}%)`];
-          });
+          if (pollData.total === 0) {
+            // ERDDAP stream mode: total is 0, progress is bytes downloaded
+            const mbDownloaded = (pollData.progress / (1024 * 1024)).toFixed(1);
+            setLogs(prev => {
+              const filtered = prev.filter(l => !l.startsWith('⏳'));
+              return [...filtered, `⏳ Downloading from ERDDAP: ${mbDownloaded} MB...`];
+            });
+          } else {
+            // Future known totals
+            const pct = pollData.total > 0 ? Math.round((pollData.progress / pollData.total) * 100) : 0;
+            setLogs(prev => {
+              const filtered = prev.filter(l => !l.startsWith('⏳'));
+              return [...filtered, `⏳ Processing: ${pollData.progress}/${pollData.total} items (${pct}%)`];
+            });
+          }
         } else if (status === 'formatting') {
           setLogs(prev => {
             const filtered = prev.filter(l => !l.startsWith('⏳'));

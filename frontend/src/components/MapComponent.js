@@ -185,8 +185,34 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
   const [instFilter, setInstFilter] = useState('all');
   const [floatCounts, setFloatCounts] = useState({ total: 0, active: 0, core: 0, bgc: 0, activeCore: 0, activeBgc: 0, ocean: {}, inst: {}, incoisTotal: 0, incoisVisible: 0, bgcParams: {} });
 
-  // BGC parameter counts come from the server (pre-computed from bio index)
-  const parameterCounts = floatCounts.bgcParams || { NO3: 0, DOXY: 0, CHLA: 0, BBP700: 0 };
+  const filteredFloats = React.useMemo(() => {
+    return activeFloats.filter(f => {
+      if (floatFilter !== 'all' && f.type !== floatFilter) return false;
+      if (!showInactive && f.status === 'inactive') return false;
+      if (oceanFilter !== 'all') {
+        const oceanLabels = {'I': 'Indian', 'P': 'Pacific', 'A': 'Atlantic', '': 'Unknown'};
+        if ((oceanLabels[f.ocean] || f.ocean) !== oceanFilter) return false;
+      }
+      if (instFilter !== 'all' && f.institution !== instFilter) return false;
+      return true;
+    });
+  }, [activeFloats, floatFilter, showInactive, oceanFilter, instFilter]);
+
+  const parameterCounts = React.useMemo(() => {
+    // Calculate parameter coverage based on the number of PROFILES taken by the floats
+    const counts = { NO3: 0, DOXY: 0, CHLA: 0, BBP700: 0, PH: 0 };
+    filteredFloats.forEach(f => {
+      if (f.params && f.params.length > 0) {
+        const pCount = f.profile_count || 1;
+        if (f.params.includes('NITRATE') || f.params.includes('NO3')) counts.NO3 += pCount;
+        if (f.params.includes('DOXY')) counts.DOXY += pCount;
+        if (f.params.includes('CHLA')) counts.CHLA += pCount;
+        if (f.params.includes('BBP700')) counts.BBP700 += pCount;
+        if (f.params.includes('PH_IN_SITU_TOTAL') || f.params.includes('PH')) counts.PH += pCount;
+      }
+    });
+    return counts;
+  }, [filteredFloats]);
 
   // Trajectory state
   const [selectedFloat, setSelectedFloat] = useState(null);
@@ -212,11 +238,11 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
       .then(data => {
           const counts = {
             total: data.count || 0,
-            active: data.active_count || 0,
+            active: data.global_active_count !== undefined ? data.global_active_count : (data.active_count || 0),
             core: data.core_count || 0,
             bgc: data.bgc_count || 0,
-            activeCore: data.active_core_count || 0,
-            activeBgc: data.active_bgc_count || 0,
+            activeCore: data.global_active_core !== undefined ? data.global_active_core : (data.active_core_count || 0),
+            activeBgc: data.global_active_bgc !== undefined ? data.global_active_bgc : (data.active_bgc_count || 0),
             ocean: data.ocean_counts || {},
             inst: data.inst_counts || {},
             incoisTotal: data.incois_total || 0,
@@ -496,17 +522,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
         ))}
 
         {/* ── Active Float Markers ── */}
-        {showActive && activeFloats
-          .filter(f => {
-            if (floatFilter !== 'all' && f.type !== floatFilter) return false;
-            if (!showInactive && f.status === 'inactive') return false;
-            if (oceanFilter !== 'all') {
-              const oceanLabels = {'I': 'Indian', 'P': 'Pacific', 'A': 'Atlantic', '': 'Unknown'};
-              if ((oceanLabels[f.ocean] || f.ocean) !== oceanFilter) return false;
-            }
-            if (instFilter !== 'all' && f.institution !== instFilter) return false;
-            return true;
-          })
+        {showActive && filteredFloats
           .map(float => {
             const rawDate = float.date || '';
             let displayDate = rawDate;
