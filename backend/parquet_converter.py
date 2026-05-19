@@ -13,8 +13,10 @@ from main import download_with_retry, process_netcdf, ParamsObj, extract_metadat
 
 DB_PATH = 'argo_index.db'
 PARQUET_BASE_DIR = 'data/parquet'
-PROCESS_POOL = multiprocessing.Pool(processes=max(1, multiprocessing.cpu_count() - 1))
 BATCH_SIZE = 100 # Process 100 files at a time
+
+# We will initialize PROCESS_POOL inside main() to avoid Windows multiprocessing spawn issues
+PROCESS_POOL = None
 
 async def get_all_profiles():
     if not os.path.exists(DB_PATH):
@@ -117,11 +119,23 @@ async def process_batch(chunk, loop):
 
 
 async def main():
+    import main as backend_main
+    import httpx
+    global PROCESS_POOL
+    
+    # Initialize process pool here to avoid Windows spawn issues
+    PROCESS_POOL = multiprocessing.Pool(processes=max(1, multiprocessing.cpu_count() - 1))
+    
+    # Initialize the global HTTP client since we aren't running inside the FastAPI lifespan
+    backend_main.HTTP_CLIENT = httpx.AsyncClient()
+    
     print("Fetching profile metadata from SQLite...")
     profiles = await get_all_profiles()
     print(f"Found {len(profiles)} profiles.")
     
     if not profiles:
+        await backend_main.HTTP_CLIENT.aclose()
+        PROCESS_POOL.close()
         return
         
     print(f"Starting Parquet conversion pipeline... Data will be saved to {PARQUET_BASE_DIR}")
@@ -142,6 +156,11 @@ async def main():
         print(f"Progress: {total_processed}/{len(profiles)} profiles | Rows extracted: {total_rows}")
 
     print("Parquet conversion complete!")
+    await backend_main.HTTP_CLIENT.aclose()
+    PROCESS_POOL.close()
+    PROCESS_POOL.join()
 
 if __name__ == "__main__":
+    # Required for Windows multiprocessing
+    multiprocessing.freeze_support()
     asyncio.run(main())
