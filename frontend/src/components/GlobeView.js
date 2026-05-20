@@ -13,11 +13,17 @@ const GlobeView = ({
     selectedFloat, 
     trajectoryPoints,
     onFloatClick,
-    bounds
+    bounds,
+    onBoundsChange
 }) => {
   const globeRef = useRef();
   const [globeReady, setGlobeReady] = useState(false);
   const [isTransitioning, setIsTransitioning] = useState(false);
+
+  // Bounding box drawing state
+  const [isDrawingMode, setIsDrawingMode] = useState(false);
+  const [firstCorner, setFirstCorner] = useState(null);
+  const [previewCorner, setPreviewCorner] = useState(null);
 
   // Set initial view to India on load
   useEffect(() => {
@@ -107,6 +113,115 @@ const GlobeView = ({
     }));
   }, [trajectoryPoints]);
 
+  // Helper: generate path coords for a bounding box
+  const generateBoxPath = useCallback((north, south, east, west) => {
+    if (isNaN(north) || isNaN(south) || isNaN(east) || isNaN(west)) return [];
+    const path = [];
+    const steps = 10;
+    // Top edge (West to East)
+    for (let i = 0; i <= steps; i++) {
+      path.push({ lat: north, lng: west + (east - west) * (i / steps) });
+    }
+    // Right edge (North to South)
+    for (let i = 0; i <= steps; i++) {
+      path.push({ lat: north - (north - south) * (i / steps), lng: east });
+    }
+    // Bottom edge (East to West)
+    for (let i = 0; i <= steps; i++) {
+      path.push({ lat: south, lng: east - (east - west) * (i / steps) });
+    }
+    // Left edge (South to North)
+    for (let i = 0; i <= steps; i++) {
+      path.push({ lat: south + (north - south) * (i / steps), lng: west });
+    }
+    return path;
+  }, []);
+
+  // Bounding box path (from finalized bounds)
+  const boxPathData = useMemo(() => {
+    if (!bounds) return [];
+    const north = parseFloat(bounds.north);
+    const south = parseFloat(bounds.south);
+    const east = parseFloat(bounds.east);
+    const west = parseFloat(bounds.west);
+    const path = generateBoxPath(north, south, east, west);
+    if (path.length === 0) return [];
+    return [{ coords: path, id: 'bounds' }];
+  }, [bounds, generateBoxPath]);
+
+  // Preview path (while drawing — between first corner and preview corner)
+  const previewPathData = useMemo(() => {
+    if (!firstCorner || !previewCorner) return [];
+    const north = Math.max(firstCorner.lat, previewCorner.lat);
+    const south = Math.min(firstCorner.lat, previewCorner.lat);
+    const east = Math.max(firstCorner.lng, previewCorner.lng);
+    const west = Math.min(firstCorner.lng, previewCorner.lng);
+    if (Math.abs(north - south) < 0.1 && Math.abs(east - west) < 0.1) return [];
+    const path = generateBoxPath(north, south, east, west);
+    if (path.length === 0) return [];
+    return [{ coords: path, id: 'preview' }];
+  }, [firstCorner, previewCorner, generateBoxPath]);
+
+  // Combined paths for rendering
+  const allPathsData = useMemo(() => {
+    if (firstCorner && previewPathData.length > 0) return previewPathData;
+    return boxPathData;
+  }, [boxPathData, previewPathData, firstCorner]);
+
+  // Globe click handler for bounding box drawing
+  const handleGlobeClick = useCallback(({ lat, lng }) => {
+    if (!isDrawingMode) return;
+
+    if (!firstCorner) {
+      // First click — set the first corner
+      setFirstCorner({ lat, lng });
+      setPreviewCorner({ lat, lng });
+    } else {
+      // Second click — finalize the bounding box
+      const north = Math.max(firstCorner.lat, lat);
+      const south = Math.min(firstCorner.lat, lat);
+      const east = Math.max(firstCorner.lng, lng);
+      const west = Math.min(firstCorner.lng, lng);
+
+      if (onBoundsChange) {
+        onBoundsChange({ north, south, east, west });
+      }
+
+      // Reset drawing state
+      setFirstCorner(null);
+      setPreviewCorner(null);
+      setIsDrawingMode(false);
+    }
+  }, [isDrawingMode, firstCorner, onBoundsChange]);
+
+  // Track mouse movement on globe for preview rectangle
+  useEffect(() => {
+    if (!isDrawingMode || !firstCorner || !globeRef.current) return;
+
+    const renderer = globeRef.current.renderer();
+    const canvas = renderer?.domElement;
+    if (!canvas) return;
+
+    const handleMouseMove = (e) => {
+      // Use the globe's internal method to convert screen coords to lat/lng
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      
+      // Convert to globe coordinates using Three.js raycasting
+      const globe = globeRef.current;
+      if (globe && globe.toGlobeCoords) {
+        const coords = globe.toGlobeCoords(x, y);
+        if (coords) {
+          setPreviewCorner({ lat: coords.lat, lng: coords.lng });
+        }
+      }
+    };
+
+    canvas.addEventListener('mousemove', handleMouseMove);
+    return () => canvas.removeEventListener('mousemove', handleMouseMove);
+  }, [isDrawingMode, firstCorner]);
+
   // Point label on hover
   const pointLabel = useCallback((d) => {
     const rawDate = d.date || '';
@@ -134,10 +249,11 @@ const GlobeView = ({
   }, []);
 
   const handlePointClick = useCallback((point) => {
+    if (isDrawingMode) return; // Don't select floats while drawing
     if (point && onFloatClick) {
       onFloatClick(point);
     }
-  }, [onFloatClick]);
+  }, [onFloatClick, isDrawingMode]);
 
   // Navigation controls
   const flyToIndia = useCallback(() => {
@@ -165,6 +281,30 @@ const GlobeView = ({
       setTimeout(() => setIsTransitioning(false), 500);
     }
   }, []);
+
+  // Toggle drawing mode
+  const toggleDrawingMode = useCallback(() => {
+    if (isDrawingMode) {
+      // Cancel drawing
+      setIsDrawingMode(false);
+      setFirstCorner(null);
+      setPreviewCorner(null);
+    } else {
+      setIsDrawingMode(true);
+      setFirstCorner(null);
+      setPreviewCorner(null);
+    }
+  }, [isDrawingMode]);
+
+  // Clear bounds
+  const clearBounds = useCallback(() => {
+    if (onBoundsChange) {
+      onBoundsChange(null);
+    }
+    setFirstCorner(null);
+    setPreviewCorner(null);
+    setIsDrawingMode(false);
+  }, [onBoundsChange]);
 
   // Waypoint label element
   const labelElement = useCallback((d) => {
@@ -203,8 +343,44 @@ const GlobeView = ({
     `;
   }, []);
 
+  // Drawing mode styles
+  const drawBtnStyle = {
+    background: isDrawingMode ? '#0284c7' : 'rgba(15,23,42,0.85)',
+    color: 'white',
+    border: isDrawingMode ? '2px solid #38bdf8' : '1px solid rgba(255,255,255,0.15)',
+    padding: '7px 12px',
+    borderRadius: '6px',
+    cursor: 'pointer',
+    fontSize: '12px',
+    fontWeight: 600,
+    fontFamily: "'Inter', sans-serif",
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    backdropFilter: 'blur(10px)',
+    transition: 'all 0.2s ease',
+    boxShadow: isDrawingMode ? '0 0 12px rgba(56,189,248,0.4)' : 'none',
+  };
+
+  const clearBtnStyle = {
+    background: 'rgba(239,68,68,0.15)',
+    color: '#fca5a5',
+    border: '1px solid rgba(239,68,68,0.3)',
+    padding: '7px 12px',
+    borderRadius: '6px',
+    cursor: 'pointer',
+    fontSize: '12px',
+    fontWeight: 600,
+    fontFamily: "'Inter', sans-serif",
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    backdropFilter: 'blur(10px)',
+    transition: 'all 0.2s ease',
+  };
+
   return (
-    <div style={{ width: '100%', height: '100vh', position: 'relative', background: '#070d1b' }}>
+    <div style={{ width: '100%', height: '100vh', position: 'relative', background: '#070d1b', cursor: isDrawingMode ? 'crosshair' : 'default' }}>
       <Globe
         ref={globeRef}
         onGlobeReady={() => setGlobeReady(true)}
@@ -249,12 +425,25 @@ const GlobeView = ({
         labelsData={isTransitioning ? [] : labelData}
         labelLat="lat"
         labelLng="lng"
-        labelText={d => d.cycle != null ? d.cycle.toString() : ''}
+        labelText={d => (d.isLast && d.cycle != null) ? d.cycle.toString() : ''}
         labelSize={d => d.isLast ? 1.0 : 0.6}
         labelColor={() => 'rgba(255,255,255,0.8)'}
         labelDotRadius={0}
         labelAltitude={0.015}
         labelLabel={labelLabel}
+        
+        // Bounds Path (finalized or preview)
+        pathsData={isTransitioning ? [] : allPathsData}
+        pathPoints="coords"
+        pathPointLat={d => d.lat}
+        pathPointLng={d => d.lng}
+        pathStroke={d => d.id === 'preview' ? '#38bdf8' : '#0284c7'}
+        pathWidth={d => d.id === 'preview' ? 1.0 : 1.5}
+        pathDashLength={d => d.id === 'preview' ? 0.5 : undefined}
+        pathDashGap={d => d.id === 'preview' ? 0.3 : undefined}
+        
+        // Globe click for bounding box drawing
+        onGlobeClick={handleGlobeClick}
         
         // Globe appearance
         atmosphereColor="#3a7bd5"
@@ -263,6 +452,73 @@ const GlobeView = ({
         width={window.innerWidth - 280}
         height={window.innerHeight}
       />
+
+      {/* Drawing Mode Instructions Banner */}
+      {isDrawingMode && (
+        <div style={{
+          position: 'absolute',
+          top: 12,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          background: 'rgba(2,132,199,0.9)',
+          color: 'white',
+          padding: '8px 20px',
+          borderRadius: '8px',
+          fontSize: '13px',
+          fontWeight: 600,
+          fontFamily: "'Inter', sans-serif",
+          backdropFilter: 'blur(10px)',
+          border: '1px solid rgba(56,189,248,0.4)',
+          zIndex: 1001,
+          pointerEvents: 'none',
+          boxShadow: '0 4px 20px rgba(0,0,0,0.3)',
+          animation: 'fadeIn 0.3s ease',
+        }}>
+          {!firstCorner 
+            ? '📍 Click on the globe to set the first corner' 
+            : '📍 Click again to set the opposite corner'}
+        </div>
+      )}
+
+      {/* Bounding Box Drawing Controls */}
+      <div style={{
+        position: 'absolute',
+        top: 72,
+        right: 14,
+        zIndex: 1000,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px',
+      }}>
+        <button 
+          style={drawBtnStyle}
+          onClick={toggleDrawingMode}
+          title={isDrawingMode ? 'Cancel Drawing' : 'Draw Bounding Box'}
+          onMouseEnter={e => e.currentTarget.style.opacity = '0.9'}
+          onMouseLeave={e => e.currentTarget.style.opacity = '1'}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <rect x="3" y="3" width="18" height="18" rx="2" strokeDasharray={isDrawingMode ? "none" : "5 3"} />
+          </svg>
+          {isDrawingMode ? 'Cancel' : 'Draw Box'}
+        </button>
+        
+        {bounds && !isDrawingMode && (
+          <button
+            style={clearBtnStyle}
+            onClick={clearBounds}
+            title="Clear Bounding Box"
+            onMouseEnter={e => e.currentTarget.style.opacity = '0.85'}
+            onMouseLeave={e => e.currentTarget.style.opacity = '1'}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+            Clear Box
+          </button>
+        )}
+      </div>
 
       {/* Custom Navigation Controls */}
       <div className="cesium-nav-controls">
@@ -296,4 +552,3 @@ const GlobeView = ({
 };
 
 export default GlobeView;
-

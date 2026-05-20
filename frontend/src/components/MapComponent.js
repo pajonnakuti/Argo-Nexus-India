@@ -9,6 +9,9 @@ import GlobeView from './GlobeView';
 import icon from 'leaflet/dist/images/marker-icon.png';
 import iconShadow from 'leaflet/dist/images/marker-shadow.png';
 
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+
 let DefaultIcon = L.icon({
   iconUrl: icon,
   shadowUrl: iconShadow,
@@ -39,7 +42,7 @@ const ActiveFloatsControl = ({ showActive, setShowActive, showInactive, setShowI
   oceanEntries.sort((a, b) => b[1] - a[1]);
 
   return (
-    <div className="leaflet-bar leaflet-control custom-control active-floats-control-wrapper" style={{ position: 'absolute', top: 120, right: 10, zIndex: 1000, margin: 0 }}>
+    <div className="leaflet-bar leaflet-control custom-control active-floats-control-wrapper" style={{ position: 'absolute', top: 160, right: 10, zIndex: 1000, margin: 0 }}>
       <div className="active-floats-dropdown">
         <button 
           className={`active-floats-btn ${showActive ? 'active' : ''}`} 
@@ -65,7 +68,7 @@ const ActiveFloatsControl = ({ showActive, setShowActive, showInactive, setShowI
           <div className="filter-divider"></div>
           <div className="filter-section-label">Status</div>
           <div className={`filter-option ${showInactive ? 'selected' : ''}`} onClick={() => setShowInactive(!showInactive)}>
-            {showInactive ? 'Hide' : 'Show'} Inactive Floats (&gt;45 days)
+            {showInactive ? 'Hide' : 'Show'} Inactive Floats (&gt;90 days)
           </div>
           
           <div className="filter-divider"></div>
@@ -227,7 +230,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
   // Fetch active floats when dates change
   useEffect(() => {
     setIsMapLoading(true);
-    let url = 'http://localhost:8000/api/active_floats';
+    let url = `${API_URL}/api/active_floats`;
     const queryParams = new URLSearchParams();
     if (startDate) queryParams.append('startDate', startDate);
     if (endDate) queryParams.append('endDate', endDate);
@@ -318,7 +321,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
     setPanCenter([float.lat, float.lon]);
 
     try {
-      const resp = await fetch(`http://localhost:8000/api/trajectory/${float.platform}`);
+      const resp = await fetch(`${API_URL}/api/trajectory/${float.platform}`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
 
@@ -396,6 +399,7 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
              trajectoryPoints={trajectoryPoints}
              onFloatClick={handleFloatClick}
              bounds={bounds}
+             onBoundsChange={onBoundsChange}
           />
       ) : (
       <MapContainer
@@ -427,21 +431,6 @@ const MapComponent = ({ onBoundsChange, bounds, onFloatCountsUpdate, startDate, 
             edit={{ edit: true, remove: true }}
           />
         </FeatureGroup>
-
-        <ActiveFloatsControl
-          showActive={showActive}
-          setShowActive={setShowActive}
-          showInactive={showInactive}
-          setShowInactive={setShowInactive}
-          floatFilter={floatFilter}
-          setFloatFilter={setFloatFilter}
-          oceanFilter={oceanFilter}
-          setOceanFilter={setOceanFilter}
-          instFilter={instFilter}
-          setInstFilter={setInstFilter}
-          floatCounts={floatCounts}
-          parameterCounts={parameterCounts}
-        />
 
         {/* ── Loading Overlay ── */}
         {isMapLoading && (

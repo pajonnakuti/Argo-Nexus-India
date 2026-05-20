@@ -5,6 +5,9 @@ import DataPreview from './components/DataPreview';
 import GridPreview from './components/GridPreview';
 import axios from 'axios';
 
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+
 function App() {
   const [bounds, setBounds] = useState(null);
   const today = new Date();
@@ -60,7 +63,7 @@ function App() {
       let url, body;
 
       if (fmt === 'diva') {
-        url = 'http://localhost:8000/api/export/diva';
+        url = `${API_URL}/api/export/diva`;
         body = {
           bounds,
           params: {
@@ -79,7 +82,7 @@ function App() {
           snr: gridConfig.snr,
         };
       } else {
-        url = `http://localhost:8000/api/export/${fmt}`;
+        url = `${API_URL}/api/export/${fmt}`;
         body = {
           bounds,
           params: {
@@ -112,7 +115,7 @@ function App() {
       let status = 'queued';
       while (status !== 'done' && status !== 'error') {
         await new Promise(r => setTimeout(r, 2000)); // Poll every 2s
-        const pollResp = await fetch(`http://localhost:8000/api/export/status/${job_id}`);
+        const pollResp = await fetch(`${API_URL}/api/export/status/${job_id}`);
         
         if (!pollResp.ok) {
           throw new Error(`Export job lost (server returned ${pollResp.status}). Please retry.`);
@@ -149,7 +152,7 @@ function App() {
 
       // Step 3: Download the file
       setLogs(prev => [...prev, `⬇️ Downloading file...`]);
-      const downloadResp = await fetch(`http://localhost:8000/api/export/download/${job_id}`);
+      const downloadResp = await fetch(`${API_URL}/api/export/download/${job_id}`);
       if (!downloadResp.ok) {
         const err = await downloadResp.json();
         throw new Error(err.detail || 'Download failed');
@@ -178,7 +181,8 @@ function App() {
       
       // Show preview for CSV format
       if (fmt === 'csv') {
-        const text = await blob.text();
+        const snippetBlob = blob.slice(0, 1024 * 10); // First 10KB
+        const text = await snippetBlob.text();
         setPreviewData(text);
       }
     } catch (err) {
@@ -201,7 +205,7 @@ function App() {
     setLogs(['Generating gridded product...']);
 
     try {
-      const response = await fetch('http://localhost:8000/api/grid', {
+      const response = await fetch(`${API_URL}/api/grid`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -239,7 +243,7 @@ function App() {
 
     setGridLoading(true);
     try {
-      const response = await fetch('http://localhost:8000/api/grid/download', {
+      const response = await fetch(`${API_URL}/api/grid/download`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

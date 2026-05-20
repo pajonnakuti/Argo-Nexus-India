@@ -410,7 +410,7 @@ async def sync_metadata_to_db(db):
     print(f"Synced {count} metadata entries")
 
 async def ensure_index_files():
-    """Downloads index files if missing or old."""
+    """Downloads index files if missing or old using memory-efficient streaming."""
     for url, path in [
         (REMOTE_INDEX_URL, LOCAL_INDEX_PATH), 
         ('https://data-argo.ifremer.fr/argo_bio-profile_index.txt', BIO_INDEX_PATH),
@@ -418,10 +418,12 @@ async def ensure_index_files():
     ]:
         if not os.path.exists(path) or (time.time() - os.path.getmtime(path)) > 86400:
             print(f"Downloading {path}...")
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url, timeout=600.0)
-                async with aiofiles.open(path, mode='w', encoding='utf-8') as f:
-                    await f.write(resp.text)
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    async with aiofiles.open(path, mode='wb') as f:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                            await f.write(chunk)
 
 async def db_query_profiles(start_date, end_date, ptype, bounds=None):
     """Queries the SQLite database for profiles."""
@@ -974,7 +976,7 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
     """Builds the active floats response object. Used by cache and endpoint.
     
     Logic: Shows floats active within the provided startDate and endDate.
-    If startDate is not provided, defaults to a 45-day lookback window from endDate.
+    If startDate is not provided, defaults to a 90-day lookback window from endDate.
     """
     
     if not endDate:
@@ -987,14 +989,14 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
     if startDate:
         start_dt = datetime.strptime(startDate, "%Y-%m-%d")
     else:
-        # Default look back 45 days from endDate for active float display
+        # Default look back 90 days from endDate for active float display
         # This aligns with the official Argo Information Centre's definition of an operational float
-        start_dt = end_dt - timedelta(days=45)
+        start_dt = end_dt - timedelta(days=90)
         
     start_str = start_dt.strftime("%Y%m%d") + "000000"
 
-    # Define operational active threshold (45 days lookback from endDate)
-    active_limit_dt = end_dt - timedelta(days=45)
+    # Define operational active threshold (90 days lookback from endDate)
+    active_limit_dt = end_dt - timedelta(days=90)
     active_limit_str = active_limit_dt.strftime("%Y%m%d") + "000000"
 
     # Single DB connection for entire computation
@@ -1002,15 +1004,22 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
         await db.execute('PRAGMA journal_mode=WAL')
         db.row_factory = aiosqlite.Row
 
-        # Fast single-pass query: GROUP BY platform with MAX(date) to get latest position.
-        # SQLite bare-column guarantee: non-aggregated columns come from the MAX(date) row.
-        # No geo filter in SQL (only 0.01% invalid rows) — filter in Python for 13x speedup.
+        # Correct query: subquery finds MAX(date) per platform, then JOIN to get actual row values.
+        # This avoids SQLite's unreliable bare-column behavior with GROUP BY.
         query = '''
-            SELECT file, platform, MAX(date) as date, lat, lon, ocean, 
-                   profiler_type, institution, type, COUNT(*) as profile_count
-            FROM profiles
-            WHERE date BETWEEN ? AND ?
-            GROUP BY platform
+            SELECT p.file, p.platform, latest.max_date as date, p.lat, p.lon,
+                   p.ocean, p.profiler_type, p.institution, p.type,
+                   latest.profile_count
+            FROM profiles p
+            INNER JOIN (
+                SELECT platform, MAX(date) as max_date, COUNT(*) as profile_count
+                FROM profiles
+                WHERE date BETWEEN ? AND ?
+                GROUP BY platform
+            ) latest ON p.platform = latest.platform AND p.date = latest.max_date
+            WHERE p.lat BETWEEN -90 AND 90
+            AND p.lon BETWEEN -180 AND 180
+            GROUP BY p.platform
         '''
         async with db.execute(query, [start_str, end_str]) as cursor:
             rows = await cursor.fetchall()
@@ -1026,14 +1035,22 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
         incois_total = (await cursor.fetchone())[0]
 
         # Get true global active counts (independent of startDate)
+        # Uses same correct subquery+JOIN approach for reliable type classification
         global_active_core = 0
         global_active_bgc = 0
         
         query_global = '''
-            SELECT platform, type
-            FROM profiles
-            WHERE date BETWEEN ? AND ?
-            GROUP BY platform
+            SELECT p.platform, p.type
+            FROM profiles p
+            INNER JOIN (
+                SELECT platform, MAX(date) as max_date
+                FROM profiles
+                WHERE date BETWEEN ? AND ?
+                GROUP BY platform
+            ) latest ON p.platform = latest.platform AND p.date = latest.max_date
+            WHERE p.lat BETWEEN -90 AND 90
+            AND p.lon BETWEEN -180 AND 180
+            GROUP BY p.platform
         '''
         async with db.execute(query_global, [active_limit_str, end_str]) as cursor:
             async for r in cursor:
@@ -1055,10 +1072,7 @@ async def _build_active_floats_response(startDate: Optional[str], endDate: Optio
     incois_bgc_visible = 0
 
     for row in rows:
-        # Skip rows with invalid coordinates (0.01% of data — filtered in Python for speed)
-        lat, lon = row['lat'], row['lon']
-        if lat is None or lon is None or lat < -90 or lat > 90 or lon < -180 or lon > 180:
-            continue
+        # Coordinates already filtered in SQL via WHERE clause
         filename = os.path.basename(row['file'])
         platform, cycle = extract_metadata(filename)
         is_bgc = platform in BGC_PLATFORMS
@@ -1748,6 +1762,36 @@ async def download_grid_netcdf(req: GridRequest):
             'Content-Disposition': f'attachment; filename="argo_gridded_{req.variable}_{req.depth_level}m_{req.resolution}deg.nc"'
         }
     )
+
+
+# Serve React static files if the build directory exists
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+frontend_build_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "build"))
+
+if os.path.exists(frontend_build_dir):
+    # Mount static assets (CSS, JS, etc.)
+    app.mount("/static", StaticFiles(directory=os.path.join(frontend_build_dir, "static")), name="static")
+
+    @app.get("/{catchall:path}")
+    async def serve_react_app(catchall: str):
+        # Ignore API calls so they fall through to their respective endpoints
+        if catchall.startswith("api"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        
+        # Serve static assets in the build folder root (e.g. favicon.ico, logo.png)
+        file_path = os.path.join(frontend_build_dir, catchall)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+            
+        # Fallback to index.html for SPA routing
+        index_file = os.path.join(frontend_build_dir, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(index_file)
+        raise HTTPException(status_code=404, detail="Not Found")
+else:
+    print(f"React build folder not found at {frontend_build_dir}. React will not be served statically by the backend.")
 
 
 if __name__ == "__main__":
